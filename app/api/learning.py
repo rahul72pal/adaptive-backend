@@ -10,7 +10,15 @@ from app.db.postgres import get_db
 from app.db.mongo import get_mongo_db
 from app.core.dependencies import get_current_user
 from app.db.models import User, DiagnosticSession
-from app.engine.curriculum_engine import generate_personalized_learning_path
+from app.engine.curriculum_engine import (
+    generate_personalized_learning_path,
+    generate_next_level_graph,
+    generate_learning_content,
+    sync_learning_path_progress,
+    slugify_topic,
+    get_available_nodes
+)
+from app.engine.mastery_engine import check_level_completion
 from app.graphs.reteach_graph import select_strategy_node
 
 logger = logging.getLogger(__name__)
@@ -21,6 +29,16 @@ class GeneratePathSchema(BaseModel):
     topic: str
     target_level: str = "expert"  # beginner, intermediate, advanced, expert
     diagnostic_session_id: Optional[str] = None
+
+class CompleteLevelSchema(BaseModel):
+    learning_path_id: str
+
+class LessonRequestSchema(BaseModel):
+    topic: str
+    concept_id: str
+    level: str = "beginner"
+    pattern: Optional[str] = "none"
+    prerequisites: List[str] = []
 
 class ReteachRequestSchema(BaseModel):
     topic: str
@@ -35,11 +53,10 @@ async def generate_path(
     db: AsyncSession = Depends(get_db),
     mongo_db: Any = Depends(get_mongo_db)
 ):
-    """Generates personalized learning path based on user's diagnostic knowledge profile."""
+    """Generates personalized learning path starting with the beginner level graph."""
     logger.info(
-        f"[generate_path] Step 1: Received request for topic='{payload.topic}', "
-        f"target_level='{payload.target_level}', diag_session_id='{payload.diagnostic_session_id}' "
-        f"from user_id={current_user.id}"
+        f"[generate_path] Request topic='{payload.topic}', target_level='{payload.target_level}', "
+        f"diag_session='{payload.diagnostic_session_id}' from user_id={current_user.id}"
     )
 
     knowledge_profile = {}
@@ -47,24 +64,16 @@ async def generate_path(
 
     if payload.diagnostic_session_id:
         try:
-            logger.info(f"[generate_path] Step 2: Querying diagnostic session ID '{payload.diagnostic_session_id}'")
             diag_uuid = uuid.UUID(payload.diagnostic_session_id)
             stmt = select(DiagnosticSession).where(DiagnosticSession.id == diag_uuid)
             res = await db.execute(stmt)
             session_rec = res.scalar_one_or_none()
             if session_rec:
                 knowledge_profile = session_rec.knowledge_profile or {}
-                logger.info(
-                    f"[generate_path] Step 2b: Found diagnostic session. "
-                    f"Loaded knowledge profile ({len(knowledge_profile)} concepts)"
-                )
-            else:
-                logger.warning(f"[generate_path] Step 2b: Diagnostic session ID '{payload.diagnostic_session_id}' not found in DB.")
         except ValueError as err:
-            logger.warning(f"[generate_path] Step 2b: Invalid diagnostic_session_id format: {err}")
+            logger.warning(f"[generate_path] Invalid diagnostic_session_id format: {err}")
 
     try:
-        logger.info(f"[generate_path] Step 3: Invoking generate_personalized_learning_path engine for topic='{payload.topic}'")
         path_doc = await generate_personalized_learning_path(
             user_id=current_user.id,
             topic=payload.topic,
@@ -74,26 +83,83 @@ async def generate_path(
             mongo_db=mongo_db,
             db=db
         )
-        path_id = path_doc.get("_id") if isinstance(path_doc, dict) else getattr(path_doc, "id", None)
-        logger.info(f"[generate_path] Step 4: Learning path created successfully! Path ID='{path_id}'")
         return path_doc
     except Exception as e:
-        logger.error(f"[generate_path] Error generating learning path for topic='{payload.topic}': {e}", exc_info=True)
+        logger.error(f"[generate_path] Error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to generate learning path: {str(e)}")
+
+@router.post("/complete-level")
+async def complete_level_and_progress(
+    payload: CompleteLevelSchema,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    mongo_db: Any = Depends(get_mongo_db)
+):
+    """Triggers generation of the next level graph when the user completes the current level."""
+    try:
+        updated_doc = await generate_next_level_graph(
+            learning_path_id=payload.learning_path_id,
+            user_id=current_user.id,
+            mongo_db=mongo_db,
+            db=db
+        )
+        return updated_doc
+    except ValueError as val_err:
+        raise HTTPException(status_code=404, detail=str(val_err))
+    except Exception as e:
+        logger.error(f"[complete_level_and_progress] Error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to progress level: {str(e)}")
+
+@router.post("/lesson")
+async def get_lesson_content(
+    payload: LessonRequestSchema,
+    current_user: User = Depends(get_current_user),
+    mongo_db: Any = Depends(get_mongo_db)
+):
+    """Generates structured lesson content for a learning node using LEARNING_CONTENT_PROMPT."""
+    try:
+        content = await generate_learning_content(
+            topic=payload.topic,
+            concept_id=payload.concept_id,
+            level=payload.level,
+            pattern=payload.pattern,
+            prerequisites=payload.prerequisites,
+            mongo_db=mongo_db
+        )
+        return content
+    except Exception as e:
+        logger.error(f"[get_lesson_content] Error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to generate lesson content: {str(e)}")
 
 @router.get("/{user_id}/{topic}")
 async def get_learning_path(
     user_id: str,
     topic: str,
     current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
     mongo_db: Any = Depends(get_mongo_db)
 ):
     """Retrieves current personalized learning path for user and topic."""
-    lp_collection = mongo_db.get_collection("learning_paths")
-    path_doc = await lp_collection.find_one({
-        "user_id": user_id,
-        "topic": topic.lower()
-    })
+    slug = slugify_topic(topic)
+    
+    path_doc = await sync_learning_path_progress(
+        user_id=user_id,
+        topic_slug=slug,
+        mongo_db=mongo_db,
+        db=db
+    )
+
+    if not path_doc:
+        lp_collection = mongo_db.get_collection("learning_paths")
+        path_doc = await lp_collection.find_one({
+            "user_id": user_id,
+            "topic": slug
+        })
+        if not path_doc:
+            path_doc = await lp_collection.find_one({
+                "user_id": user_id,
+                "topic": topic.lower()
+            })
 
     if not path_doc:
         raise HTTPException(status_code=404, detail="Learning path not found for given user and topic.")

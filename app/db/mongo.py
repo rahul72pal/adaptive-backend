@@ -181,15 +181,17 @@ async def init_mongo() -> None:
     """Initializes MongoDB connection or activates in-memory fallback."""
     global mongo_client, mongo_db, is_in_memory_fallback
     tls_kwargs = {}
-    try:
-        import certifi
-        tls_kwargs["tlsCAFile"] = certifi.where()
-    except Exception:
-        pass
+    mongo_url = settings.MONGO_URL or ""
+    if "mongodb+srv://" in mongo_url or "tls=true" in mongo_url.lower() or "ssl=true" in mongo_url.lower():
+        try:
+            import certifi
+            tls_kwargs["tlsCAFile"] = certifi.where()
+        except Exception:
+            pass
 
     try:
         mongo_client = AsyncIOMotorClient(
-            settings.MONGO_URL,
+            mongo_url,
             serverSelectionTimeoutMS=2000,
             connectTimeoutMS=2000,
             socketTimeoutMS=2000,

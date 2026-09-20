@@ -9,12 +9,21 @@ from app.llm.schemas import QuestionBatchSchema
 
 logger = logging.getLogger(__name__)
 
+DIFFICULTY_DESCRIPTIONS = {
+    1: "definition-recall level, testing basic core concepts and syntax",
+    2: "simple direct application of concept with straightforward examples",
+    3: "intermediate problem-solving and standard usage scenarios",
+    4: "advanced concept application involving edge cases and complex scenarios",
+    5: "expert mastery requiring combining this concept with unusual edge cases or complex scenarios"
+}
+
 def sanitize_question_for_client(q: Dict[str, Any]) -> Dict[str, Any]:
-    """Strips grading rubrics and correct answers before sending to the client."""
+    """Strips grading rubrics, correct answers, and internal Mongo _id before sending to the client."""
     safe_q = dict(q)
     safe_q.pop("correct_option", None)
     safe_q.pop("rubric", None)
     safe_q.pop("expected_answer", None)
+    safe_q.pop("_id", None)
     return safe_q
 
 async def get_or_generate_question(
@@ -35,21 +44,7 @@ async def get_or_generate_question(
     )
     if batch:
         return random.choice(batch)
-    
-    fallback_id = f"q_fallback_{uuid.uuid4().hex[:6]}"
-    fallback_doc = {
-        "_id": fallback_id,
-        "id": fallback_id,
-        "topic": topic,
-        "concept_id": concept_id,
-        "concept_type": concept_type,
-        "difficulty": difficulty,
-        "type": "mcq",
-        "question": f"What is a core principle of {concept_id} in {topic}?",
-        "options": ["Correct principle implementation", "Invalid approach A", "Invalid approach B", "Invalid approach C"],
-        "execution_method": "llm_rubric"
-    }
-    return sanitize_question_for_client(fallback_doc)
+    raise RuntimeError(f"No questions could be generated for concept '{concept_id}'.")
 
 async def get_or_generate_question_batch(
     topic: str,
@@ -73,10 +68,15 @@ async def get_or_generate_question_batch(
             "difficulty": difficulty
         }
         try:
-            existing_questions = await asyncio.wait_for(
+            raw_existing = await asyncio.wait_for(
                 q_collection.find(filter_query).to_list(20),
                 timeout=3.0
             )
+            existing_questions = [
+                q for q in raw_existing
+                if not str(q.get("_id", "")).startswith("q_fallback_")
+                and not str(q.get("id", "")).startswith("q_fallback_")
+            ]
         except Exception as e:
             logger.warning(f"Failed to read questions from MongoDB: {e}")
             existing_questions = []
@@ -89,6 +89,7 @@ async def get_or_generate_question_batch(
     # 3. Cache miss/low pool -> generate a small mini-batch of questions (3-5)
     needed = count - len(existing_questions)
     previous_titles = [q.get("question", "")[:50] for q in existing_questions]
+    diff_desc = DIFFICULTY_DESCRIPTIONS.get(difficulty, "standard conceptual understanding")
 
     try:
         res = await call_llm_gateway(
@@ -96,11 +97,13 @@ async def get_or_generate_question_batch(
             {
                 "topic": topic_clean,
                 "concept_id": concept_id,
+                "pattern": "none",
                 "concept_type": concept_type,
                 "difficulty": difficulty,
+                "difficulty_description": diff_desc,
                 "question_type": "practice" if concept_type == "code" else "mcq",
                 "count": min(needed, 3),  # Keeps tokens within safe limits
-                "previous_question_titles": previous_titles
+                "previous_question_titles": str(previous_titles) if previous_titles else "None"
             },
             QuestionBatchSchema
         )
@@ -152,38 +155,10 @@ async def get_or_generate_question_batch(
 
     except Exception as err:
         logger.error(f"Batch generation failed for '{concept_id}': {err}", exc_info=True)
+        raise RuntimeError(f"Failed to generate questions for concept '{concept_id}': {err}")
 
-    # 4. Fallback filler if pool is still below requested count
-    while len(existing_questions) < count:
-        idx = len(existing_questions) + 1
-        fallback_id = f"q_fallback_{concept_id}_{idx}_{uuid.uuid4().hex[:4]}"
-        fallback_doc = {
-            "_id": fallback_id,
-            "id": fallback_id,
-            "topic": topic_clean,
-            "concept_id": concept_id,
-            "concept_type": concept_type,
-            "difficulty": difficulty,
-            "type": "mcq",
-            "question": f"Which statement best applies to '{concept_id}' in {topic}?",
-            "options": [
-                f"Standard established implementation of {concept_id}",
-                f"Deprecated pattern in {concept_id}",
-                "Invalid execution behavior",
-                "Unrelated syntax component"
-            ],
-            "correct_option": f"Standard established implementation of {concept_id}",
-            "rubric": "Evaluates fundamental understanding.",
-            "test_cases": None,
-            "expected_answer": None,
-            "execution_method": "exact_match"
-        }
-        if q_collection is not None:
-            try:
-                await q_collection.insert_one(fallback_doc)
-            except Exception as fe:
-                logger.warning(f"Could not insert fallback doc: {fe}")
-        existing_questions.append(fallback_doc)
+    if not existing_questions:
+        raise RuntimeError(f"No questions generated for concept '{concept_id}'.")
 
     return [sanitize_question_for_client(q) for q in existing_questions[:count]]
 

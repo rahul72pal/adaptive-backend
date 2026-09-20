@@ -19,9 +19,15 @@ class Settings(BaseSettings):
     # Groq API Specs
     GROQ_API_KEY: str = ""
     GROQ_MODEL_NAME: str = "llama-3.3-70b-versatile"
+
+    # Custom / OpenAI-Compatible (vLLM, Ollama, LocalAI, NVIDIA NIM) Specs
+    CUSTOM_API_KEY: str = ""
+    CUSTOM_API_BASE: str = ""
+    CUSTOM_BASE_URL: str = ""
+    CUSTOM_MODEL_NAME: str = ""
     
     # LLM Generation Limits
-    LLM_MAX_TOKENS: int = 1024
+    LLM_MAX_TOKENS: int = 5000
 
     # Databases
     POSTGRES_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/adaptive_learn"

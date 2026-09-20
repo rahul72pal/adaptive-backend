@@ -58,7 +58,7 @@ async def test_full_platform_flow():
         assert res.status_code == 200
         assert res.json()["is_complete"] is True
 
-        # 7. Generate Personalized Learning Path
+        # 7. Generate Progressive Level-Wise Learning Path (Beginner Level)
         path_payload = {
             "topic": "React",
             "target_level": "expert",
@@ -69,13 +69,38 @@ async def test_full_platform_flow():
         lp_data = res.json()
         assert "nodes" in lp_data
         assert len(lp_data["nodes"]) > 0
+        assert lp_data["current_level"] == "beginner"
+        path_id = lp_data["_id"]
 
-        # 8. Retrieve Learning Path
+        # Verify node_type field exists in generated nodes
+        first_node = lp_data["nodes"][0]
+        assert "node_type" in first_node
+        assert first_node["node_type"] in ["learning", "practice"]
+
+        # 8. Fetch Learning Content for a Learning Node
+        learning_node = next((n for n in lp_data["nodes"] if n["node_type"] == "learning"), first_node)
+        lesson_payload = {
+            "topic": "React",
+            "concept_id": learning_node["concept_id"],
+            "level": "beginner",
+            "pattern": learning_node.get("pattern", "none"),
+            "prerequisites": learning_node.get("depends_on", [])
+        }
+        res = await client.post("/api/learning/lesson", json=lesson_payload, headers=headers)
+        assert res.status_code == 200
+        lesson_data = res.json()
+        assert "intuition" in lesson_data
+        assert "core_idea" in lesson_data
+        assert "mechanism" in lesson_data
+
+        # 9. Retrieve Learning Path and check available_nodes
         res = await client.get(f"/api/learning/{user_id}/react", headers=headers)
         assert res.status_code == 200
-        assert res.json()["user_id"] == user_id
+        path_retrieved = res.json()
+        assert path_retrieved["user_id"] == user_id
+        assert "available_nodes" in path_retrieved
 
-        # 9. Generate Question for concept 'state'
+        # 10. Generate Question for concept 'state'
         q_gen_payload = {
             "topic": "React",
             "concept_id": "state",
@@ -89,7 +114,7 @@ async def test_full_platform_flow():
         assert "question" in q_data
         q_id = q_data["_id"]
 
-        # 10. Submit Question Attempt
+        # 11. Submit Question Attempt
         attempt_payload = {
             "question_id": q_id,
             "concept_id": "state",
@@ -103,7 +128,15 @@ async def test_full_platform_flow():
         assert "score" in att_data
         assert "mastery_update" in att_data
 
-        # 11. Retrieve Deterministic Progress & Mastery Breakdown
+        # 12. Complete Level & Progress to Next Level (Intermediate)
+        complete_payload = {"learning_path_id": path_id}
+        res = await client.post("/api/learning/complete-level", json=complete_payload, headers=headers)
+        assert res.status_code == 200
+        next_level_data = res.json()
+        assert next_level_data["current_level"] == "intermediate"
+        assert len(next_level_data["nodes"]) >= len(lp_data["nodes"])
+
+        # 13. Retrieve Deterministic Progress & Mastery Breakdown
         res = await client.get(f"/api/progress/{user_id}/react", headers=headers)
         assert res.status_code == 200
         prog_data = res.json()
@@ -111,7 +144,7 @@ async def test_full_platform_flow():
         assert "overall_mastery" in prog_data
         assert "current_level" in prog_data
 
-        # 12. Test Adaptive Re-Teaching Node
+        # 14. Test Adaptive Re-Teaching Node
         reteach_payload = {
             "topic": "React",
             "concept_id": "state",

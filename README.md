@@ -181,3 +181,8 @@ This verifies:
 | `/api/questions/generate` | POST | Fetch or generate concept question | Yes |
 | `/api/attempts/submit` | POST | Submit attempt & compute multi-signal mastery | Yes |
 | `/api/progress/{user_id}/{topic}` | GET | Get overall mastery & level unlock breakdown | Yes |
+
+
+docker compose up -d --force-recreate
+
+docker exec -it adaptive_mongo mongosh

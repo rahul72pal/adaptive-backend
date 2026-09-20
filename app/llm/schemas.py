@@ -14,17 +14,23 @@ class ConceptNodeItem(BaseModel):
     id: Optional[str] = None
     concept_id: Optional[str] = None
     level: str = "beginner"
+    node_type: str = "learning"  # learning | practice
     concept_type: str = "conceptual"
+    pattern: Optional[str] = None
     status: Optional[str] = "learning"
     action: Optional[str] = "full_teach"
     estimated_minutes: Optional[int] = 15
+    target_question_count: Optional[int] = 0
     depends_on: List[str] = Field(default_factory=list)
 
     def model_post_init(self, __context: Any) -> None:
-        if not self.id and self.concept_id:
-            self.id = self.concept_id
-        elif not self.concept_id and self.id:
+        if not self.concept_id and self.id:
             self.concept_id = self.id
+        elif not self.id and self.concept_id:
+            self.id = self.concept_id
+        if not self.concept_id or not str(self.concept_id).strip():
+            raise ValueError("ConceptNodeItem must have a valid non-empty concept_id or id")
+
 
 class ConceptGraphSchema(BaseModel):
     topic: str
@@ -67,3 +73,17 @@ class LessonExplanationSchema(BaseModel):
     concept_id: str
     strategy: str  # analogy, visual_diagram, interactive_exercise, worked_example
     content: str
+
+class LessonContentSchema(BaseModel):
+    concept_id: str
+    intuition: str
+    core_idea: str
+    mechanism: str
+    step_by_step_example: Optional[str] = None
+    code_snippet: Optional[str] = None
+    time_complexity: Optional[str] = None
+    space_complexity: Optional[str] = None
+    edge_cases: Optional[List[str]] = Field(default_factory=list)
+    common_mistakes: Optional[List[str]] = Field(default_factory=list)
+    checkpoint_question: Optional[str] = None
+

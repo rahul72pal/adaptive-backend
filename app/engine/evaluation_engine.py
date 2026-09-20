@@ -110,6 +110,8 @@ async def evaluate_user_attempt(
             "concept_id": question_doc.get("concept_id", "concept"),
             "question": question_doc.get("question", ""),
             "rubric": question_doc.get("rubric") or question_doc.get("expected_answer", "Correct implementation required"),
+            "expected_time_complexity": question_doc.get("expected_time_complexity") or "N/A",
+            "expected_space_complexity": question_doc.get("expected_space_complexity") or "N/A",
             "answer": user_answer,
             "execution_feedback": execution_feedback
         },

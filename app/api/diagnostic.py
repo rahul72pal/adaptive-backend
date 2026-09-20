@@ -58,7 +58,7 @@ async def start_diagnostic(
             "user_id": str(current_user.id),
             "topic": payload.topic,
             "concept_checklist": concept_checklist,
-            "knowledge_profile": {c: {"confidence": 0.5, "status": "partial"} for c in concept_checklist},
+            "knowledge_profile": {c: {"confidence": 0.0, "status": "unassessed"} for c in concept_checklist},
             "current_concept": None,
             "current_question": None,
             "last_user_answer": None,
@@ -87,14 +87,11 @@ async def start_diagnostic(
 
         response_payload = {
             "session_id": session_id,
-            "turns_used": state.get("turns_used", 1),
             "turn": state.get("turns_used", 1),
             "current_concept": state.get("current_concept"),
-            "concept": state.get("current_concept"),
             "current_question": state.get("current_question"),
-            "question": state.get("current_question"),
             "is_complete": False,
-            "knowledge_profile": initial_state["knowledge_profile"]
+            "knowledge_profile": state.get("knowledge_profile", initial_state["knowledge_profile"])
         }
         logger.info(f"[start_diagnostic] Step 8: Returning diagnostic start payload to frontend for session_id='{session_id}'")
         return response_payload
@@ -146,7 +143,6 @@ async def answer_diagnostic(
     if is_complete:
         return {
             "session_id": payload.session_id,
-            "turns_used": turns_used,
             "turn": turns_used,
             "is_complete": True,
             "knowledge_profile": profile
@@ -154,12 +150,9 @@ async def answer_diagnostic(
 
     return {
         "session_id": payload.session_id,
-        "turns_used": turns_used,
         "turn": turns_used,
         "current_concept": updated_state.get("current_concept"),
-        "concept": updated_state.get("current_concept"),
         "current_question": updated_state.get("current_question"),
-        "question": updated_state.get("current_question"),
         "is_complete": False,
         "knowledge_profile": profile
     }
@@ -180,7 +173,7 @@ async def opt_out(
         raise HTTPException(status_code=404, detail="Session not found.")
 
     checklist = current_state.values.get("concept_checklist", [])
-    zero_profile = {c: {"confidence": 0.0, "status": "unknown"} for c in checklist}
+    zero_profile = {c: {"confidence": 0.0, "status": "unassessed"} for c in checklist}
 
     await graph_app.aupdate_state(
         thread_config,

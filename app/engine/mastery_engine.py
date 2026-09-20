@@ -147,3 +147,39 @@ async def calculate_topic_progress(
         "total_concepts_count": total_concepts,
         "concept_breakdown": breakdown
     }
+
+async def check_level_completion(
+    user_id: uuid.UUID,
+    topic: str,
+    level: str,
+    level_concept_ids: List[str],
+    db: AsyncSession,
+    mastery_threshold: float = 0.80
+) -> Dict[str, Any]:
+    """Checks if required concepts for a given level have met the mastery threshold."""
+    if not level_concept_ids:
+        return {"is_completed": True, "level": level, "avg_mastery": 1.0, "mastered_count": 0, "total_count": 0}
+
+    stmt = select(ConceptMastery).where(
+        ConceptMastery.user_id == user_id,
+        ConceptMastery.topic == topic,
+        ConceptMastery.concept_id.in_(level_concept_ids)
+    )
+    res = await db.execute(stmt)
+    records = res.scalars().all()
+
+    mastery_map = {r.concept_id: r.mastery for r in records}
+    scores = [mastery_map.get(cid, 0.0) for cid in level_concept_ids]
+    avg_mastery = sum(scores) / len(scores) if scores else 0.0
+    mastered_count = sum(1 for s in scores if s >= mastery_threshold)
+    
+    is_completed = bool(avg_mastery >= mastery_threshold or mastered_count == len(level_concept_ids))
+
+    return {
+        "is_completed": is_completed,
+        "level": level,
+        "avg_mastery": round(avg_mastery, 4),
+        "mastered_count": mastered_count,
+        "total_count": len(level_concept_ids)
+    }
+
