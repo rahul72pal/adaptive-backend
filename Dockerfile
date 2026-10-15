@@ -18,5 +18,6 @@ COPY . .
 # Expose FastAPI port
 EXPOSE 8000
 
-# Run FastAPI app with uvicorn
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Run FastAPI app with uvicorn hot-reload
+# --reload watches for file changes and restarts automatically (development mode)
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload", "--reload-dir", "/app"]

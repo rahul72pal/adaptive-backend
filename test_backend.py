@@ -33,14 +33,27 @@ async def test_full_platform_flow():
         assert res.status_code == 200
         assert res.json()["email"] == user_email
 
+        # 3.5. Set Topic Mode Choice
+        mode_payload = {"topic": "React", "mode_choice": "diagnostic"}
+        res = await client.post("/api/topics/mode", json=mode_payload, headers=headers)
+        assert res.status_code == 200
+        assert res.json()["mode_choice"] == "diagnostic"
+
         # 4. Start Diagnostic Chat Session
         diag_start_payload = {"topic": "React"}
         res = await client.post("/api/diagnostic/start", json=diag_start_payload, headers=headers)
-        assert res.status_code == 201
+        assert res.status_code in [200, 201]
         diag_data = res.json()
         assert "session_id" in diag_data
         session_id = diag_data["session_id"]
         assert "current_question" in diag_data
+
+        # 4.5. Test Resuming Active Session (start again for same topic)
+        res_resume = await client.post("/api/diagnostic/start", json=diag_start_payload, headers=headers)
+        assert res_resume.status_code in [200, 201]
+        resume_data = res_resume.json()
+        assert resume_data["session_id"] == session_id
+        assert resume_data.get("is_resumed") is True
 
         # 5. Answer Diagnostic Turn
         ans_payload = {
@@ -92,6 +105,17 @@ async def test_full_platform_flow():
         assert "intuition" in lesson_data
         assert "core_idea" in lesson_data
         assert "mechanism" in lesson_data
+
+        # 8.5. Complete Node and verify current_node updates
+        complete_node_payload = {
+            "topic": "React",
+            "concept_id": learning_node["concept_id"]
+        }
+        res = await client.post("/api/learning/complete-node", json=complete_node_payload, headers=headers)
+        assert res.status_code == 200
+        completed_path_data = res.json()
+        assert "current_node" in completed_path_data
+        assert completed_path_data["current_node"] != learning_node["concept_id"] or len(completed_path_data["nodes"]) == 1
 
         # 9. Retrieve Learning Path and check available_nodes
         res = await client.get(f"/api/learning/{user_id}/react", headers=headers)

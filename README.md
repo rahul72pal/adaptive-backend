@@ -135,6 +135,8 @@ To launch PostgreSQL, MongoDB, Redis, and the FastAPI Backend together:
 ```bash
 docker compose up -d
 ```
+docker compose up -d; docker compose logs -f backend
+
 
 To stop containers:
 ```bash

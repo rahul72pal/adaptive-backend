@@ -46,6 +46,11 @@ services:
       - MONGO_URL=mongodb://mongodb:27017
       - REDIS_URL=redis://redis:6379/0
       - JWT_SECRET=super-secret-jwt-key-change-in-production-123456789
+      # Force polling-based file watching — required on Windows/WSL where
+      # inotify events don't propagate reliably across volume mounts
+      - WATCHFILES_FORCE_POLLING=true
+      - PYTHONUNBUFFERED=1
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload --reload-dir /app
     depends_on:
       postgres:
         condition: service_healthy
@@ -53,6 +58,7 @@ services:
         condition: service_started
       redis:
         condition: service_started
+
 
 volumes:
   postgres_data:

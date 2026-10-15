@@ -1,43 +1,71 @@
-import json
-import logging
-import re
-from typing import Type, Any, Dict, Optional, List
-from dataclasses import dataclass, field
-import httpx
-from pydantic import BaseModel, Field
+"""
+LLM Gateway — Production-Level LangChain / LangGraph Integration
+================================================================
 
-from langchain_core.messages import (
-    HumanMessage,
-    AIMessage,
-    SystemMessage,
-)
-from langchain_core.prompts import ChatPromptTemplate
+Architecture
+------------
+  LLMConfig (validated)
+       │
+       ▼
+  build_chat_model()   ←── app/llm/providers.py
+       │
+       ▼
+  AgentService          ←── streaming & non-streaming agent execution
+       │
+       ├── astream_chat_response()    →  async generator of typed events
+       └── get_chat_response()        →  single response dict
+
+  call_llm_gateway()               →  structured JSON call (Pydantic schema)
+  call_llm_gateway_stream()        →  streaming text delta generator
+
+Design decisions
+----------------
+* NO silent fallbacks — if the configured provider fails, the error is raised
+  immediately so callers receive a deterministic 5xx instead of a mystery
+  "fallback" response from an unexpected model.
+* Structured output uses ``parse_json_from_llm_response`` with ``attempt_repair_json``
+  as a single recovery layer, then fails hard.
+* All provider configuration comes from ``LLMConfig`` Pydantic objects —
+  no raw env-var reads inside this file.
+* LangGraph ``create_react_agent`` is used for the agent executor (LangGraph-native,
+  replaces the deprecated ``langchain.agents.create_agent``).
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import time
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Type, Union
+
+import httpx
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.output_parsers import PydanticOutputParser
+from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.callbacks import AsyncCallbackHandler
 from langchain_core.outputs import LLMResult
-
-from langchain_openai import ChatOpenAI
-try:
-    from langchain_openrouter import ChatOpenRouter
-except ImportError:
-    ChatOpenRouter = None
-
-from langchain.agents import create_agent
+from pydantic import BaseModel
 
 from app.core.config import Settings, settings
 from app.core.logger import logger
-from app.utils.exceptions import (
-    DeepSeekAPIException,
-    DeepSeekTimeoutException,
-    RateLimitException,
+from app.llm.config import (
+    AnthropicConfig,
+    CustomConfig,
+    GeminiConfig,
+    OpenAIConfig,
+    llm_config_from_settings,
+    mask_api_key,
 )
-from app.utils.tool import web_search, document_search
+from app.llm.providers import build_chat_model
+from app.utils.exceptions import DeepSeekAPIException
+from app.utils.tool import document_search, reset_search_counter, web_search
 from app.services.prompt_service import PromptService
 
 
-# ------------------------------------------------------------------
-# Structured Normalization & Helper Data Structures
-# ------------------------------------------------------------------
+# ===========================================================================
+# Stream normalisation helpers
+# ===========================================================================
 
 @dataclass
 class NormalizedStreamChunk:
@@ -46,19 +74,16 @@ class NormalizedStreamChunk:
     tool_call: Optional[Dict[str, Any]] = None
 
 
-class StreamEventNormalizer:
-    """Normalizes provider-specific LangChain stream chunks into unified text, reasoning, and tool_call parts."""
+_INTERNAL_MARKERS = (
+    "<think>", "</think>",
+    "<tool_call>", "</tool_call>",
+    "<function>", "</function>",
+    "<|DSML|>", "<｜DSML｜",
+)
 
-    INTERNAL_MARKERS = [
-        "<think>",
-        "</think>",
-        "<tool_call>",
-        "</tool_call>",
-        "<function>",
-        "</function>",
-        "<|DSML|>",
-        "<｜DSML｜",
-    ]
+
+class StreamEventNormalizer:
+    """Normalises provider-specific LangChain stream chunks into text/reasoning/tool_call."""
 
     @classmethod
     def normalize_chunk(cls, chunk: Any) -> NormalizedStreamChunk:
@@ -76,7 +101,6 @@ class StreamEventNormalizer:
                     if isinstance(block, str):
                         norm.text += block
                     continue
-
                 b_type = block.get("type")
                 if b_type == "text":
                     norm.text += block.get("text", "")
@@ -96,18 +120,16 @@ class StreamEventNormalizer:
         if isinstance(reasoning, str):
             norm.reasoning += reasoning
 
-        # Filter out explicit protocol markers and thinking blocks from text
         if norm.text:
             if "<think>" in norm.text or "</think>" in norm.text:
-                think_match = re.findall(r'<think>([\s\S]*?)(?:</think>|$)', norm.text, flags=re.IGNORECASE)
+                think_match = re.findall(
+                    r"<think>([\s\S]*?)(?:</think>|$)", norm.text, flags=re.IGNORECASE
+                )
                 if think_match:
                     norm.reasoning += " ".join(think_match)
                 norm.text = clean_thinking_text(norm.text)
-            elif "Here's a thinking process:" in norm.text or "Thinking Process:" in norm.text:
-                norm.reasoning += norm.text
-                norm.text = clean_thinking_text(norm.text)
             else:
-                for marker in cls.INTERNAL_MARKERS:
+                for marker in _INTERNAL_MARKERS:
                     if marker in norm.text:
                         norm.text = norm.text.replace(marker, "")
 
@@ -115,260 +137,113 @@ class StreamEventNormalizer:
 
 
 def clean_thinking_text(text: str) -> str:
-    """Final sanitizer layer to clean leftover reasoning/thinking blocks and protocol markers from complete response."""
+    """Remove reasoning/thinking blocks and protocol markers from LLM response text."""
     if not text:
         return text
 
-    # 1. Strip complete <think>...</think> tags
-    text = re.sub(r'<think>[\s\S]*?</think>', '', text, flags=re.IGNORECASE)
-    # 2. Strip unclosed <think>... tags up to end of text
-    text = re.sub(r'<think>[\s\S]*$', '', text, flags=re.IGNORECASE)
+    text = re.sub(r"<think>[\s\S]*?</think>", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"<think>[\s\S]*$", "", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"(?:Here's a thinking process|Thinking Process|\[Thinking Process\])[\s\S]*?"
+        r"(?=\n\n[A-Z0-9]|\n[A-Z0-9]|\Z)",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"<\|DSML\|>[\s\S]*?</\|DSML\|>", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"<function>[\s\S]*?</function>", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"<tool_call>[\s\S]*?</tool_call>", "", text, flags=re.IGNORECASE)
 
-    # 3. Strip "Here's a thinking process:" or "Thinking Process:" blocks
-    text = re.sub(r'(?:Here\'s a thinking process|Thinking Process|\[Thinking Process\])[\s\S]*?(?=\n\n[A-Z0-9]|\n[A-Z0-9]|\Z)', '', text, flags=re.IGNORECASE)
-
-    # 4. Strip protocol markers
-    text = re.sub(r'<\|DSML\|>[\s\S]*?</\|DSML\|>', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'<function>[\s\S]*?</function>', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'<tool_call>[\s\S]*?</tool_call>', '', text, flags=re.IGNORECASE)
-
-    # 5. Strip explicit step-by-step thinking preambles
-    if re.search(r'1\.\s*Analyze User Input:', text, flags=re.IGNORECASE):
-        match = re.search(r'(?:1\.\s*Analyze User Input:[\s\S]*?)(?:\d+\.\s*(?:Retrieve|Formulate|Structure|Respond)[\s\S]*?\n\n|\n\n(?=[A-Z0-9]))([\s\S]*)', text, flags=re.IGNORECASE)
+    if re.search(r"1\.\s*Analyze User Input:", text, flags=re.IGNORECASE):
+        match = re.search(
+            r"(?:1\.\s*Analyze User Input:[\s\S]*?)(?:\d+\.\s*(?:Retrieve|Formulate|Structure|Respond)"
+            r"[\s\S]*?\n\n|\n\n(?=[A-Z0-9]))([\s\S]*)",
+            text,
+            flags=re.IGNORECASE,
+        )
         if match and match.group(1).strip():
             text = match.group(1).strip()
         else:
-            text = re.sub(r'1\.\s*Analyze User Input:[\s\S]*$', '', text, flags=re.IGNORECASE).strip()
+            text = re.sub(r"1\.\s*Analyze User Input:[\s\S]*$", "", text, flags=re.IGNORECASE).strip()
 
-    # 6. Strip query rewriter JSON blocks if echoed by agent
-    text = re.sub(r'^\s*\{\s*"queries"\s*:\s*\[[\s\S]*?\]\s*,\s*"keywords"\s*:\s*\[[\s\S]*?\]\s*\}\s*', '', text, flags=re.IGNORECASE)
+    text = re.sub(
+        r'^\s*\{\s*"queries"\s*:\s*\[[\s\S]*?\]\s*,\s*"keywords"\s*:\s*\[[\s\S]*?\]\s*\}\s*',
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
 
-    for marker in ["<think>", "</think>", "<|DSML|>", "</|DSML|>", "<function>", "</function>", "<tool_call>", "</tool_call>"]:
+    for marker in ("<think>", "</think>", "<|DSML|>", "</|DSML|>", "<function>", "</function>", "<tool_call>", "</tool_call>"):
         text = text.replace(marker, "")
 
     return text.strip()
 
 
+# ===========================================================================
+# Token & reasoning tracking callback
+# ===========================================================================
+
 class TokenAndReasoningCallbackHandler(AsyncCallbackHandler):
-    """Callback handler to accumulate token usage and reasoning details across agent steps."""
+    """Accumulates token usage and reasoning content across agent steps."""
 
     def __init__(self) -> None:
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
         self.total_tokens = 0
-        self.last_reasoning = None
+        self.last_reasoning: Optional[Any] = None
 
     async def on_llm_end(self, response: LLMResult, **kwargs: Any) -> None:
         for generations in response.generations:
             for gen in generations:
                 message = getattr(gen, "message", None)
-                if message is not None:
-                    usage = getattr(message, "usage_metadata", None)
-                    if usage is not None:
-                        self.total_prompt_tokens += usage.get("input_tokens", 0)
-                        self.total_completion_tokens += usage.get("output_tokens", 0)
-                        self.total_tokens += usage.get("total_tokens", 0)
-                    else:
-                        metadata = getattr(message, "response_metadata", {}) or {}
-                        if isinstance(metadata, dict):
-                            token_usage = metadata.get("token_usage", {}) or metadata.get("usage", {})
-                            if isinstance(token_usage, dict):
-                                self.total_prompt_tokens += token_usage.get("prompt_tokens", 0) or token_usage.get("input_tokens", 0)
-                                self.total_completion_tokens += token_usage.get("completion_tokens", 0) or token_usage.get("output_tokens", 0)
-                                self.total_tokens += token_usage.get("total_tokens", 0)
+                if message is None:
+                    continue
+                usage = getattr(message, "usage_metadata", None)
+                if usage is not None:
+                    self.total_prompt_tokens += usage.get("input_tokens", 0)
+                    self.total_completion_tokens += usage.get("output_tokens", 0)
+                    self.total_tokens += usage.get("total_tokens", 0)
+                else:
+                    meta = getattr(message, "response_metadata", {}) or {}
+                    if isinstance(meta, dict):
+                        toks = meta.get("token_usage", {}) or meta.get("usage", {})
+                        if isinstance(toks, dict):
+                            self.total_prompt_tokens += toks.get("prompt_tokens", 0) or toks.get("input_tokens", 0)
+                            self.total_completion_tokens += toks.get("completion_tokens", 0) or toks.get("output_tokens", 0)
+                            self.total_tokens += toks.get("total_tokens", 0)
 
-                    reasoning = (
-                        message.additional_kwargs.get("reasoning_details")
-                        or message.additional_kwargs.get("reasoning_content")
-                        or message.additional_kwargs.get("reasoning")
-                    )
-                    if reasoning is not None:
-                        self.last_reasoning = reasoning
-
-
-# ------------------------------------------------------------------
-# LLM Provider Registry Functions
-# ------------------------------------------------------------------
-PROVIDER_REGISTRY: Dict[str, Any] = {}
-
-def register_provider(name: str):
-    def decorator(fn):
-        PROVIDER_REGISTRY[name.lower()] = fn
-        return fn
-    return decorator
+                reasoning = (
+                    message.additional_kwargs.get("reasoning_details")
+                    or message.additional_kwargs.get("reasoning_content")
+                    or message.additional_kwargs.get("reasoning")
+                )
+                if reasoning is not None:
+                    self.last_reasoning = reasoning
 
 
-@register_provider("anthropic")
-def create_anthropic_model(
-    *,
-    api_key: str,
-    model: str,
-    temperature: float = 0.7,
-    max_tokens: int = 5000,
-    http_async_client=None,
-    **kwargs
-):
-    try:
-        from langchain_anthropic import ChatAnthropic
-        return ChatAnthropic(
-            api_key=api_key,
-            model=model,
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
-    except ImportError:
-        logger.warning("langchain_anthropic not installed. Falling back to OpenRouter / OpenAI.")
-        if ChatOpenRouter is not None:
-            return ChatOpenRouter(
-                model=model,
-                openrouter_api_key=api_key,
-                streaming=True,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                request_timeout=600,
-            )
-        return ChatOpenAI(
-            api_key=api_key,
-            model=model,
-            base_url="https://openrouter.ai/api/v1",
-            streaming=True,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            http_async_client=http_async_client,
-        )
-
-
-@register_provider("gemini")
-def create_gemini_model(
-    *,
-    api_key: str,
-    model: str,
-    temperature: float = 0.7,
-    max_tokens: int = 5000,
-    http_async_client=None,
-    **kwargs
-):
-    try:
-        from langchain_google_genai import ChatGoogleGenerativeAI
-        return ChatGoogleGenerativeAI(
-            google_api_key=api_key,
-            model=model,
-            temperature=temperature,
-            max_output_tokens=max_tokens,
-        )
-    except ImportError:
-        logger.warning("langchain_google_genai not installed. Falling back to OpenRouter / OpenAI.")
-        if ChatOpenRouter is not None:
-            return ChatOpenRouter(
-                model=model,
-                openrouter_api_key=api_key,
-                streaming=True,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                request_timeout=600,
-            )
-        return ChatOpenAI(
-            api_key=api_key,
-            model=model,
-            base_url="https://openrouter.ai/api/v1",
-            streaming=True,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            http_async_client=http_async_client,
-        )
-
-
-@register_provider("openai")
-def create_openai_model(
-    *,
-    api_key: str,
-    model: str,
-    temperature: float = 0.7,
-    max_tokens: int = 5000,
-    http_async_client=None,
-    **kwargs
-):
-    return ChatOpenAI(
-        api_key=api_key,
-        model=model,
-        streaming=True,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        http_async_client=http_async_client,
-    )
-
-
-@register_provider("openai-compatible")
-@register_provider("custom")
-def create_openai_compatible_model(
-    *,
-    api_key: str,
-    model: str,
-    base_url: str | None = None,
-    temperature: float = 0.7,
-    max_tokens: int = 5000,
-    http_async_client=None,
-    **kwargs
-):
-    if base_url:
-        return ChatOpenAI(
-            api_key=api_key,
-            model=model,
-            base_url=base_url,
-            streaming=True,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            http_async_client=http_async_client,
-        )
-    return ChatOpenAI(
-        api_key=api_key,
-        model=model,
-        streaming=True,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        http_async_client=http_async_client,
-    )
-
-
-@register_provider("openrouter")
-def create_openrouter_model(
-    *,
-    api_key: str,
-    model: str,
-    temperature: float = 0.7,
-    max_tokens: int = 5000,
-    http_async_client=None,
-    **kwargs
-):
-    if ChatOpenRouter is not None:
-        return ChatOpenRouter(
-            model=model,
-            openrouter_api_key=api_key,
-            streaming=True,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            request_timeout=600,
-        )
-    return ChatOpenAI(
-        api_key=api_key,
-        model=model,
-        base_url="https://openrouter.ai/api/v1",
-        streaming=True,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        http_async_client=http_async_client,
-    )
-
-
-# ------------------------------------------------------------------
-# Agent Service Execution Flow
-# ------------------------------------------------------------------
+# ===========================================================================
+# Agent Service
+# ===========================================================================
 
 class AgentService:
-    """Service to handle agent creation and communication using dynamic User LLM Configuration & System Prompts."""
+    """
+    Manages LangGraph agent creation and execution.
 
-    def __init__(self, client: Optional[httpx.AsyncClient] = None, settings_obj: Optional[Settings] = None) -> None:
-        self.client = client or httpx.AsyncClient(timeout=httpx.Timeout(connect=15.0, read=None, write=30.0, pool=30.0))
+    Uses the validated ``LLMConfig`` from ``llm_config_from_settings()`` or
+    a user-supplied config dict for per-request overrides.
+
+    **No fallbacks** — if the provider fails, the exception propagates so
+    the API layer returns a deterministic error response.
+    """
+
+    def __init__(
+        self,
+        client: Optional[httpx.AsyncClient] = None,
+        settings_obj: Optional[Settings] = None,
+    ) -> None:
+        self.client = client or httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=15.0, read=None, write=30.0, pool=30.0)
+        )
         self.settings = settings_obj or settings
         self.prompt_service = PromptService()
         self.default_system_prompt = self.prompt_service.get_system_prompt()
@@ -376,117 +251,93 @@ class AgentService:
 
     @property
     def system_prompt(self) -> str:
-        """Exposes the default system prompt for fallback compatibility."""
         return self.default_system_prompt
 
-    def _get_llm_model(self, llm_config: Optional[Dict[str, Any]] = None):
-        """Constructs an LLM model instance using registered provider functions."""
-        llm_async_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=15.0, read=None, write=30.0, pool=30.0)
-        )
-        logger.info(f"LLM Config==> {llm_config}")
+    # ------------------------------------------------------------------
+    # LLM instantiation
+    # ------------------------------------------------------------------
 
-        if not llm_config or not llm_config.get("api_key"):
-            provider = (getattr(self.settings, "LLM_PROVIDER", "") or "openai").lower()
-            if provider == "gemini" and getattr(self.settings, "GEMINI_API_KEY", ""):
-                llm_config = {
-                    "config_type": "provider",
-                    "provider": "gemini",
-                    "api_key": self.settings.GEMINI_API_KEY,
-                    "default_model": self.settings.GEMINI_MODEL_NAME,
-                    "max_tokens": getattr(self.settings, "LLM_MAX_TOKENS", 5000),
-                }
-            elif provider == "openrouter" and getattr(self.settings, "OPENROUTER_API_KEY", ""):
-                llm_config = {
-                    "config_type": "provider",
-                    "provider": "openrouter",
-                    "api_key": self.settings.OPENROUTER_API_KEY,
-                    "default_model": getattr(self.settings, "OPENROUTER_MODEL_NAME", self.settings.LLM_MODEL_NAME),
-                    "max_tokens": getattr(self.settings, "LLM_MAX_TOKENS", 5000),
-                }
-            elif provider == "custom":
-                import os
-                custom_url = getattr(self.settings, "CUSTOM_BASE_URL", "") or getattr(self.settings, "CUSTOM_API_BASE", "") or os.getenv("CUSTOM_BASE_URL", "") or os.getenv("CUSTOM_API_BASE", "")
-                custom_key = getattr(self.settings, "CUSTOM_API_KEY", "") or os.getenv("CUSTOM_API_KEY", "") or "dummy-key"
-                llm_config = {
-                    "config_type": "custom",
-                    "base_url": custom_url,
-                    "api_key": custom_key,
-                    "model": getattr(self.settings, "CUSTOM_MODEL_NAME", "") or self.settings.LLM_MODEL_NAME,
-                    "max_tokens": getattr(self.settings, "LLM_MAX_TOKENS", 5000),
-                }
-            elif getattr(self.settings, "OPENAI_API_KEY", ""):
-                llm_config = {
-                    "config_type": "provider",
-                    "provider": "openai",
-                    "api_key": self.settings.OPENAI_API_KEY,
-                    "default_model": self.settings.LLM_MODEL_NAME,
-                    "max_tokens": getattr(self.settings, "LLM_MAX_TOKENS", 5000),
-                }
+    def _resolve_llm_config(
+        self, llm_config: Optional[Dict[str, Any]] = None
+    ) -> Union[OpenAIConfig, GeminiConfig, AnthropicConfig, CustomConfig]:
+        """
+        Build a typed ``LLMConfig`` from:
+          1. A per-request ``llm_config`` dict (user-supplied model override), or
+          2. The application environment settings.
 
-        if not llm_config or not llm_config.get("api_key"):
+        Raises ``DeepSeekAPIException`` with HTTP 400 if configuration is missing
+        or invalid — fail-fast, no silent fallbacks.
+        """
+        if llm_config and llm_config.get("api_key"):
+            # Per-request user config — build from dict
+            return self._build_config_from_dict(llm_config)
+
+        # Fall back to env / settings
+        try:
+            return llm_config_from_settings(self.settings)
+        except (ValueError, Exception) as exc:
             raise DeepSeekAPIException(
-                message="LLM configuration not found for user. Please configure your LLM API Key and Model at /llm-config.",
-                status_code=400
-            )
+                message=f"LLM configuration error: {exc}. "
+                        "Please configure your LLM provider in the environment or /llm-config.",
+                status_code=400,
+            ) from exc
 
-        config_type = llm_config.get("config_type", "provider")
-        api_key = llm_config.get("api_key", "").strip()
+    def _build_config_from_dict(
+        self, d: Dict[str, Any]
+    ) -> Union[OpenAIConfig, GeminiConfig, AnthropicConfig, CustomConfig]:
+        """Build a typed LLMConfig from a user-supplied dict."""
+        provider_raw = (d.get("provider") or d.get("config_type") or "openai").lower().strip()
+        api_key = (d.get("api_key") or "").strip()
+        model = (
+            d.get("model") or d.get("default_model") or ""
+        ).strip()
+        temperature = float(d.get("temperature") or 0.7)
+        max_tokens = int(d.get("max_tokens") or 4096)
+
         if not api_key:
-            raise DeepSeekAPIException(
-                message="API key missing in user LLM configuration.",
-                status_code=400
-            )
+            raise DeepSeekAPIException(message="api_key missing in user LLM configuration.", status_code=400)
+        if not model:
+            raise DeepSeekAPIException(message="model missing in user LLM configuration.", status_code=400)
 
-        temperature = float(llm_config.get("temperature", 0.7)) if llm_config.get("temperature") is not None else 0.7
-        max_tokens = int(llm_config.get("max_tokens", 5000)) if llm_config.get("max_tokens") is not None else 5000
-
-        if config_type == "provider":
-            provider_name = (llm_config.get("provider") or "openrouter").lower()
-            model_name = llm_config.get("default_model") or llm_config.get("model")
-            if not model_name:
-                raise DeepSeekAPIException(
-                    message="Model name missing in user LLM configuration.",
-                    status_code=400
-                )
-
-            creator_fn = PROVIDER_REGISTRY.get(provider_name, PROVIDER_REGISTRY.get("openai"))
-            logger.info(f"Instantiating model using registered provider '{provider_name}' | model: '{model_name}' | temp: {temperature} | max_tokens: {max_tokens}")
-            return creator_fn(
+        if provider_raw == "openai":
+            return OpenAIConfig(
                 api_key=api_key,
-                model=model_name,
+                model=model,
+                base_url=d.get("base_url") or "https://api.openai.com/v1",
                 temperature=temperature,
                 max_tokens=max_tokens,
-                http_async_client=llm_async_client
             )
-
-        elif config_type == "custom":
-            base_url = llm_config.get("base_url")
-            model_name = llm_config.get("model")
-            if not base_url or not model_name:
+        if provider_raw == "gemini":
+            return GeminiConfig(api_key=api_key, model=model, temperature=temperature, max_tokens=max_tokens)
+        if provider_raw == "anthropic":
+            return AnthropicConfig(api_key=api_key, model=model, temperature=temperature, max_tokens=max_tokens)
+        if provider_raw in ("custom", "openai-compatible"):
+            base_url = d.get("base_url") or ""
+            if not base_url:
                 raise DeepSeekAPIException(
-                    message="Custom LLM configuration requires both 'base_url' and 'model'.",
-                    status_code=400
+                    message="Custom LLM requires 'base_url'.", status_code=400
                 )
+            return CustomConfig(api_key=api_key, model=model, base_url=base_url, temperature=temperature, max_tokens=max_tokens)
 
-            creator_fn = PROVIDER_REGISTRY.get("openai-compatible")
-            logger.info(f"Instantiating openai-compatible model for custom endpoint: '{base_url}' | model: '{model_name}' | temp: {temperature} | max_tokens: {max_tokens}")
-            return creator_fn(
-                api_key=api_key,
-                model=model_name,
-                base_url=base_url,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                http_async_client=llm_async_client
-            )
-        else:
-            raise DeepSeekAPIException(
-                message=f"Unsupported configuration type '{config_type}'.",
-                status_code=400
-            )
+        raise DeepSeekAPIException(
+            message=f"Unsupported provider '{provider_raw}'.", status_code=400
+        )
+
+    def _get_llm_model(
+        self,
+        llm_config: Optional[Dict[str, Any]] = None,
+        *,
+        streaming: bool = False,
+    ) -> Any:
+        config = self._resolve_llm_config(llm_config)
+        return build_chat_model(config, http_async_client=self.client, streaming=streaming)
+
+    # ------------------------------------------------------------------
+    # Agent executor builder
+    # ------------------------------------------------------------------
 
     def _format_system_prompt(self, prompt: str) -> str:
-        """Dynamically injects current date and time reference into system prompt."""
+        """Inject current date/time into system prompt."""
         from datetime import datetime
         try:
             import pytz
@@ -498,44 +349,50 @@ class AgentService:
 
         if "{current_time_str}" in prompt:
             return prompt.replace("{current_time_str}", current_time_str)
-
         if "Current Date & Time Reference:" not in prompt and "Current Time:" not in prompt:
             return f"{prompt}\n\n[Current Date & Time Reference: {current_time_str}]"
-
         return prompt
 
     def _create_agent_executor(
         self,
         llm_config: Optional[Dict[str, Any]] = None,
         system_prompt: Optional[str] = None,
-        behavior: Optional[str] = None
-    ):
-        """Compiles an agent executor with specified model configuration and system prompt."""
+        behavior: Optional[str] = None,
+    ) -> Any:
+        """
+        Build a LangGraph ReAct agent executor.
+
+        Uses ``langgraph.prebuilt.create_react_agent`` (the recommended
+        LangGraph-native approach) instead of the deprecated
+        ``langchain.agents.create_agent``.
+        """
         custom_behavior = system_prompt if system_prompt is not None else behavior
-        model = self._get_llm_model(llm_config)
+        model = self._get_llm_model(llm_config, streaming=True)
         prompt = self.prompt_service.get_system_prompt(behavior=custom_behavior)
         formatted_prompt = self._format_system_prompt(prompt)
 
         try:
-            from langchain.agents.middleware import SummarizationMiddleware
-            middleware_list = [
-                SummarizationMiddleware(
+            from langgraph.prebuilt import create_react_agent
+            return create_react_agent(
+                model=model,
+                tools=self.tools,
+                state_modifier=formatted_prompt,
+            )
+        except ImportError:
+            # Fallback to langchain agent if langgraph not available
+            try:
+                from langchain.agents import create_agent
+                return create_agent(
                     model=model,
-                    trigger=("messages", 50),
-                    keep=("messages", 20)
+                    tools=self.tools,
+                    system_prompt=formatted_prompt,
+                    debug=False,
                 )
-            ]
-        except Exception as mw_err:
-            logger.warning(f"SummarizationMiddleware import warning: {mw_err}")
-            middleware_list = []
-
-        return create_agent(
-            model=model,
-            tools=self.tools,
-            system_prompt=formatted_prompt,
-            middleware=middleware_list,
-            debug=False
-        )
+            except ImportError as exc:
+                raise RuntimeError(
+                    "Neither langgraph nor langchain.agents is available. "
+                    "Install: pip install langgraph langchain"
+                ) from exc
 
     def _convert_messages(self, messages: List[Dict[str, Any]]) -> List[Any]:
         lc_messages = []
@@ -549,20 +406,32 @@ class AgentService:
             elif role == "system":
                 lc_messages.append(SystemMessage(content=content))
             elif role == "assistant":
-                kwargs = {}
+                kwargs: Dict[str, Any] = {}
                 if reasoning_details is not None:
                     kwargs["reasoning_details"] = reasoning_details
                 lc_messages.append(AIMessage(content=content, additional_kwargs=kwargs))
         return lc_messages
 
+    # ------------------------------------------------------------------
+    # Streaming chat response
+    # ------------------------------------------------------------------
+
     async def astream_chat_response(
         self,
         messages: List[Dict[str, Any]],
         llm_config: Optional[Dict[str, Any]] = None,
-        system_prompt: Optional[str] = None
+        system_prompt: Optional[str] = None,
     ):
-        """Streams multi-event updates (tool execution status, reasoning deltas, text deltas, final result)."""
-        agent_executor = self._create_agent_executor(llm_config=llm_config, system_prompt=system_prompt)
+        """
+        Stream multi-event updates: tool status, reasoning deltas, text
+        deltas, and a final ``done`` event.
+
+        **Fail-fast**: On agent failure, yields a single ``error`` event
+        and stops — no fallback content is generated.
+        """
+        agent_executor = self._create_agent_executor(
+            llm_config=llm_config, system_prompt=system_prompt
+        )
         lc_messages = self._convert_messages(messages)
         callback_handler = TokenAndReasoningCallbackHandler()
 
@@ -570,16 +439,14 @@ class AgentService:
         full_reasoning = ""
         active_tool_depth = 0
 
-        # Reset document search attempt counter at start of turn
-        from app.utils.tool import reset_search_counter
         reset_search_counter()
 
         try:
-            logger.info("Streaming agent execution events...")
+            logger.info("[AgentService] Streaming agent execution…")
             async for event in agent_executor.astream_events(
                 {"messages": lc_messages},
                 version="v2",
-                config={"callbacks": [callback_handler], "recursion_limit": 10}
+                config={"callbacks": [callback_handler], "recursion_limit": 10},
             ):
                 event_kind = event.get("event")
                 event_name = event.get("name", "")
@@ -593,18 +460,19 @@ class AgentService:
                     elif isinstance(tool_input, str):
                         query_str = tool_input
 
-                    user_status = f"Searching using {event_name}..."
                     if event_name == "web_search":
-                        user_status = f"Searching web for '{query_str}'..." if query_str else "Searching web..."
+                        user_status = f"Searching web for '{query_str}'…" if query_str else "Searching web…"
                     elif event_name == "document_search":
-                        user_status = f"Searching knowledge base for '{query_str}'..." if query_str else "Searching knowledge base..."
+                        user_status = f"Searching knowledge base for '{query_str}'…" if query_str else "Searching knowledge base…"
+                    else:
+                        user_status = f"Using {event_name}…"
 
                     yield {
                         "type": "status",
                         "status": "searching",
                         "tool": event_name,
                         "message": user_status,
-                        "query": query_str
+                        "query": query_str,
                     }
 
                 elif event_kind == "on_tool_end":
@@ -613,22 +481,18 @@ class AgentService:
                         "type": "status",
                         "status": "tool_completed",
                         "tool": event_name,
-                        "message": f"Finished {event_name} execution"
+                        "message": f"Finished {event_name}",
                     }
 
                 elif event_kind == "on_chat_model_stream":
-                    # Ignore LLM stream deltas emitted by inner tool models while a tool is executing
                     if active_tool_depth > 0:
                         continue
-
                     chunk = event.get("data", {}).get("chunk")
                     if chunk:
                         norm = StreamEventNormalizer.normalize_chunk(chunk)
-
                         if norm.text:
                             full_content += norm.text
                             yield {"type": "text_delta", "delta": norm.text}
-
                         if norm.reasoning:
                             full_reasoning += norm.reasoning
 
@@ -648,507 +512,557 @@ class AgentService:
                                 callback_handler.total_completion_tokens += toks.get("completion_tokens", 0) or toks.get("output_tokens", 0)
                                 callback_handler.total_tokens += toks.get("total_tokens", 0)
 
-            # Fallback calculation if provider does not report token usage metadata in streaming
+            # Estimate tokens if provider didn't report them
             if callback_handler.total_prompt_tokens == 0:
-                estimated_prompt = sum(len(str(m.get("content", ""))) // 4 for m in messages)
-                callback_handler.total_prompt_tokens = max(12, estimated_prompt)
-
+                callback_handler.total_prompt_tokens = max(
+                    12, sum(len(str(m.get("content", ""))) // 4 for m in messages)
+                )
             if callback_handler.total_completion_tokens == 0:
-                estimated_completion = len(full_content) // 4
-                callback_handler.total_completion_tokens = max(5, estimated_completion)
-
-            callback_handler.total_tokens = callback_handler.total_prompt_tokens + callback_handler.total_completion_tokens
-
-            usage_dict = {
-                "prompt_tokens": callback_handler.total_prompt_tokens,
-                "completion_tokens": callback_handler.total_completion_tokens,
-                "total_tokens": callback_handler.total_tokens
-            }
-
-            clean_content = clean_thinking_text(full_content)
+                callback_handler.total_completion_tokens = max(5, len(full_content) // 4)
+            callback_handler.total_tokens = (
+                callback_handler.total_prompt_tokens + callback_handler.total_completion_tokens
+            )
 
             yield {
                 "type": "done",
-                "message": clean_content,
+                "message": clean_thinking_text(full_content),
                 "reasoning_details": callback_handler.last_reasoning or full_reasoning or None,
-                "usage": usage_dict
+                "usage": {
+                    "prompt_tokens": callback_handler.total_prompt_tokens,
+                    "completion_tokens": callback_handler.total_completion_tokens,
+                    "total_tokens": callback_handler.total_tokens,
+                },
             }
 
         except Exception as exc:
-            logger.exception(f"Error in astream_chat_response: {exc}")
+            logger.exception("[AgentService] Agent execution failed: %s", exc)
+            # NO fallback response — surface the real error
             err_str = str(exc)
-            if "Recursion limit" in err_str or "GraphRecursionError" in str(type(exc)):
-                fallback_msg = "Information search reached maximum retry attempts without finding conclusive facts. Please refine your query or verify uploaded documents."
+            if "Recursion limit" in err_str or "GraphRecursionError" in type(exc).__name__:
+                code = "RECURSION_LIMIT"
+                message = "Agent search reached maximum recursion depth. Refine your query or reduce context."
+            elif "RateLimit" in err_str or "429" in err_str:
+                code = "RATE_LIMIT"
+                message = "LLM provider rate limit reached. Please wait and retry."
+            elif "AuthenticationError" in err_str or "401" in err_str:
+                code = "AUTH_ERROR"
+                message = "LLM API key is invalid or expired. Check your configuration."
             else:
-                fallback_msg = "Server issue: Please contact the chatbot owner."
+                code = "AGENT_ERROR"
+                message = f"Agent execution failed: {err_str}"
+
             yield {
-                "type": "text_delta",
-                "delta": fallback_msg
+                "type": "error",
+                "code": code,
+                "message": message,
             }
-            yield {
-                "type": "done",
-                "message": fallback_msg,
-                "reasoning_details": None,
-                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-            }
+
+    # ------------------------------------------------------------------
+    # Non-streaming chat response
+    # ------------------------------------------------------------------
 
     async def get_chat_response(
         self,
         messages: List[Dict[str, Any]],
         llm_config: Optional[Dict[str, Any]] = None,
-        system_prompt: Optional[str] = None
+        system_prompt: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Calls the agent workflow and returns final response message and metadata."""
-        try:
-            agent_executor = self._create_agent_executor(llm_config=llm_config, system_prompt=system_prompt)
-            lc_messages = self._convert_messages(messages)
+        """
+        Invoke agent and return final response dict.
 
-            logger.info("Invoking compiled agent workflow...")
-            callback_handler = TokenAndReasoningCallbackHandler()
+        **Fail-fast**: On failure, raises — callers decide how to handle.
+        """
+        agent_executor = self._create_agent_executor(
+            llm_config=llm_config, system_prompt=system_prompt
+        )
+        lc_messages = self._convert_messages(messages)
+        callback_handler = TokenAndReasoningCallbackHandler()
 
-            response = await agent_executor.ainvoke(
-                {"messages": lc_messages},
-                config={"callbacks": [callback_handler], "recursion_limit": 10}
+        logger.info("[AgentService] Invoking agent…")
+        response = await agent_executor.ainvoke(
+            {"messages": lc_messages},
+            config={"callbacks": [callback_handler], "recursion_limit": 10},
+        )
+
+        if isinstance(response, dict) and "messages" in response:
+            content = response["messages"][-1].content
+        else:
+            content = getattr(response, "output", str(response))
+
+        content = clean_thinking_text(content)
+
+        if callback_handler.total_prompt_tokens == 0:
+            callback_handler.total_prompt_tokens = max(
+                12, sum(len(str(m.get("content", ""))) // 4 for m in messages)
             )
+        if callback_handler.total_completion_tokens == 0:
+            callback_handler.total_completion_tokens = max(5, len(content) // 4)
+        callback_handler.total_tokens = (
+            callback_handler.total_prompt_tokens + callback_handler.total_completion_tokens
+        )
 
-            if isinstance(response, dict) and "messages" in response:
-                final_message = response["messages"][-1]
-                content = final_message.content
-            else:
-                content = getattr(response, "output", str(response))
-
-            content = clean_thinking_text(content)
-
-            if callback_handler.total_prompt_tokens == 0:
-                estimated_prompt = sum(len(str(m.get("content", ""))) // 4 for m in messages)
-                callback_handler.total_prompt_tokens = max(12, estimated_prompt)
-
-            if callback_handler.total_completion_tokens == 0:
-                estimated_completion = len(content) // 4
-                callback_handler.total_completion_tokens = max(5, estimated_completion)
-
-            callback_handler.total_tokens = callback_handler.total_prompt_tokens + callback_handler.total_completion_tokens
-
-            usage_dict = {
+        return {
+            "message": content,
+            "usage": {
                 "prompt_tokens": callback_handler.total_prompt_tokens,
                 "completion_tokens": callback_handler.total_completion_tokens,
-                "total_tokens": callback_handler.total_tokens
-            }
-
-            return {
-                "message": content,
-                "usage": usage_dict,
-                "reasoning_details": callback_handler.last_reasoning
-            }
-
-        except Exception as exc:
-            logger.exception(f"Unexpected error in get_chat_response: {exc}")
-            fallback_msg = "Server issue: Please contact the chatbot owner."
-            return {
-                "message": fallback_msg,
-                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-                "reasoning_details": None
-            }
+                "total_tokens": callback_handler.total_tokens,
+            },
+            "reasoning_details": callback_handler.last_reasoning,
+        }
 
 
-# ------------------------------------------------------------------
-# Structured JSON LLM Gateway (For Engine Graphs & Direct Schemas)
-# ------------------------------------------------------------------
+# ===========================================================================
+# JSON repair utility
+# ===========================================================================
 
-def parse_json_from_llm_response(text: str, schema: Type[BaseModel], topic_hint: str = "") -> BaseModel:
-    """Extracts valid JSON payload safely, ignoring conversational preambles and thinking blocks."""
+def attempt_repair_json(content: str) -> Optional[Any]:
+    """Attempt to repair truncated JSON strings."""
+    if not content:
+        return None
+
+    start_brace = content.find("{")
+    start_bracket = content.find("[")
+
+    if start_brace == -1 and start_bracket == -1:
+        return None
+
+    start = (
+        start_brace
+        if (start_brace != -1 and (start_bracket == -1 or start_brace < start_bracket))
+        else start_bracket
+    )
+    candidate = content[start:]
+
+    last_brace = candidate.rfind("}")
+    last_bracket = candidate.rfind("]")
+    cut_off = max(last_brace, last_bracket)
+
+    if cut_off != -1:
+        truncated = candidate[: cut_off + 1]
+        stack: List[str] = []
+        in_string = False
+        escape = False
+
+        for char in truncated:
+            if escape:
+                escape = False
+                continue
+            if char == "\\":
+                escape = True
+                continue
+            if char == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if char in "{[":
+                stack.append(char)
+            elif char == "}" and stack and stack[-1] == "{":
+                stack.pop()
+            elif char == "]" and stack and stack[-1] == "[":
+                stack.pop()
+
+        closing = "".join("}" if b == "{" else "]" for b in reversed(stack))
+        try:
+            return json.loads(truncated + closing, strict=False)
+        except Exception:
+            pass
+
+    # Strategy 2: bracket-stack repair on full candidate
+    stack = []
+    in_string = False
+    escape = False
+
+    for char in candidate:
+        if escape:
+            escape = False
+            continue
+        if char == "\\":
+            escape = True
+            continue
+        if char == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if char in "{[":
+            stack.append(char)
+        elif char == "}" and stack and stack[-1] == "{":
+            stack.pop()
+        elif char == "]" and stack and stack[-1] == "[":
+            stack.pop()
+
+    suffix = '"' if in_string else ""
+    suffix += "".join("}" if b == "{" else "]" for b in reversed(stack))
+
+    try:
+        return json.loads(candidate + suffix, strict=False)
+    except Exception:
+        return None
+
+
+# ===========================================================================
+# Schema normalisation & JSON parsing
+# ===========================================================================
+
+def _get_format_instructions(schema: Type[BaseModel]) -> str:
+    """Return format instructions for the given schema."""
+    if hasattr(schema, "format_instructions") and callable(getattr(schema, "format_instructions")):
+        return schema.format_instructions()
+    parser = PydanticOutputParser(pydantic_object=schema)
+    return (
+        parser.get_format_instructions()
+        + "\nCRITICAL: Return ONLY a raw valid JSON object. No intro text, no preamble, no markdown."
+    )
+
+
+def _normalize_payload(
+    parsed: Any,
+    schema: Type[BaseModel],
+    topic_hint: str = "",
+) -> BaseModel:
+    """Normalise raw parsed dict/list into target schema."""
+    if hasattr(schema, "normalize") and callable(getattr(schema, "normalize")):
+        return schema.normalize(parsed, hint=topic_hint)
+    return schema.model_validate(parsed)
+
+
+def preprocess_llm_json_string(content: str) -> str:
+    """Fix invalid triple-quotes, unescaped code-span quotes, and block strings in LLM raw JSON responses."""
+    if not content:
+        return content
+
+    def _fix_triple(match: re.Match) -> str:
+        inner = match.group(1)
+        inner_escaped = (
+            inner.replace("\\", "\\\\")
+            .replace('"', '\\"')
+            .replace("\r\n", "\\n")
+            .replace("\n", "\\n")
+        )
+        return f'"{inner_escaped}"'
+
+    # Fix """...""" and '''...'''
+    content = re.sub(r'"""([\s\S]*?)"""', _fix_triple, content)
+    content = re.sub(r"'''([\s\S]*?)'''", _fix_triple, content)
+
+    def _fix_backtick_quotes(match: re.Match) -> str:
+        inner = match.group(0)
+        # Replace unescaped " with ' inside backticks to prevent breaking JSON string delimiters
+        return re.sub(r'(?<!\\)"', "'", inner)
+
+    # Fix unescaped double quotes inside markdown code fences and backtick expressions
+    content = re.sub(r'```[\s\S]*?```', _fix_backtick_quotes, content)
+    content = re.sub(r'`[^`\n]+`', _fix_backtick_quotes, content)
+
+    return content
+
+
+def parse_json_from_llm_response(
+    text: Any,
+    schema: Type[BaseModel],
+    topic_hint: str = "",
+) -> BaseModel:
+    """
+    Extract and parse valid JSON from an LLM response, then validate against schema.
+
+    Raises ``ValueError`` if no valid JSON can be extracted — no silent
+    partial returns.
+    """
     if not text:
         raise ValueError("Empty LLM response received")
 
-    logger.info("[LLM Gateway] Raw response type: %s", type(text))
-    logger.info("[LLM Gateway] Raw response repr: %r", text[:5000])
-    logger.info("[LLM Gateway] Response starts with: %r", text[:100])
-    logger.info("[LLM Gateway] Response ends with: %r", text[-100:])
+    if isinstance(text, list):
+        parts = []
+        for block in text:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                parts.append(block.get("text", "") or block.get("content", ""))
+        text = "\n".join(parts)
 
-    # 1. Clean thinking blocks and protocol markers
+    if not isinstance(text, str):
+        text = str(text)
+
+    logger.debug("[LLM Gateway] Raw response repr: %r", text[:3000])
+
     content = clean_thinking_text(text).strip()
 
-    # 2. Remove markdown code fences if present
+    # Strip markdown code fences
     if content.startswith("```json"):
         content = content[7:].strip()
     elif content.startswith("```"):
         content = content[3:].strip()
-
     if content.endswith("```"):
         content = content[:-3].strip()
-
     if "```json" in content:
         content = content.split("```json", 1)[1].split("```", 1)[0].strip()
     elif "```" in content:
         content = content.split("```", 1)[1].split("```", 1)[0].strip()
 
-    # 3. Direct json.loads attempt
+    # Preprocess triple quotes and unescaped block strings
+    content = preprocess_llm_json_string(content)
+
+    # Direct parse
     try:
-        parsed = json.loads(content)
-        if isinstance(parsed, dict):
-            return schema.model_validate(parsed)
-        elif isinstance(parsed, list):
-            dict_data = {"topic": topic_hint or "DSA", "nodes": parsed, "concepts": parsed}
-            return schema.model_validate(dict_data)
+        parsed = json.loads(content, strict=False)
+        return _normalize_payload(parsed, schema, topic_hint=topic_hint)
     except Exception as e:
-        logger.debug(f"[LLM Gateway] Direct json.loads failed ({e}), trying candidate extraction...")
+        logger.debug("[LLM Gateway] Direct json.loads failed: %s", e)
 
-    # 4. Substring candidate extraction: first '{' to last '}'
-    start = content.find('{')
-    end = content.rfind('}')
-
-    if start != -1 and end != -1 and end > start:
-        candidate = content[start:end + 1]
+    # Repair attempt
+    repaired = attempt_repair_json(content)
+    if repaired is not None:
         try:
-            parsed = json.loads(candidate)
-            if isinstance(parsed, dict):
-                return schema.model_validate(parsed)
+            logger.info("[LLM Gateway] Using repaired JSON.")
+            return _normalize_payload(repaired, schema, topic_hint=topic_hint)
         except Exception as e:
-            logger.debug(f"[LLM Gateway] First-to-last brace json.loads failed ({e})...")
+            logger.debug("[LLM Gateway] Repair validation failed: %s", e)
 
-    # 5. Candidate extraction: raw_decode starting at first '{'
+    # Substring extraction: first '{' to last '}'
+    start = content.find("{")
+    end = content.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        try:
+            parsed = json.loads(content[start : end + 1], strict=False)
+            return _normalize_payload(parsed, schema, topic_hint=topic_hint)
+        except Exception as e:
+            logger.debug("[LLM Gateway] Brace-extraction failed: %s", e)
+
+    # raw_decode from first '{'
     if start != -1:
-        substring = content[start:]
         try:
-            parsed, _ = json.JSONDecoder().raw_decode(substring)
-            if isinstance(parsed, dict):
-                return schema.model_validate(parsed)
+            parsed, _ = json.JSONDecoder(strict=False).raw_decode(content[start:])
+            return _normalize_payload(parsed, schema, topic_hint=topic_hint)
         except Exception:
             pass
 
-    # 6. Candidate extraction: check raw array [...]
-    first_arr = content.find('[')
-    last_arr = content.rfind(']')
+    # Array fallback
+    first_arr = content.find("[")
+    last_arr = content.rfind("]")
     if first_arr != -1 and last_arr > first_arr:
-        arr_candidate = content[first_arr:last_arr + 1]
         try:
-            parsed = json.loads(arr_candidate)
-            if isinstance(parsed, list):
-                dict_data = {"topic": topic_hint or "DSA", "nodes": parsed, "concepts": parsed}
-                return schema.model_validate(dict_data)
+            parsed = json.loads(content[first_arr : last_arr + 1], strict=False)
+            return _normalize_payload(parsed, schema, topic_hint=topic_hint)
         except Exception:
             pass
 
-    # 7. Candidate extraction: Search all '{' occurrences
-    for match in re.finditer(r'\{', content):
-        s_pos = match.start()
+    # Multi-object scan
+    for match in re.finditer(r"\{", content):
         try:
-            parsed, _ = json.JSONDecoder().raw_decode(content[s_pos:])
-            if isinstance(parsed, dict):
-                return schema.model_validate(parsed)
+            parsed, _ = json.JSONDecoder(strict=False).raw_decode(content[match.start() :])
+            return _normalize_payload(parsed, schema, topic_hint=topic_hint)
         except Exception:
             continue
 
     raise ValueError(
-        f"No JSON object could be extracted from response: {text[:2000]}"
+        f"No valid JSON could be extracted from LLM response for schema "
+        f"'{schema.__name__}'. Response (first 2000 chars): {text[:2000]}"
     )
 
 
-
-
-def _is_placeholder_key(key: str) -> bool:
-    if not key:
-        return True
-    k = key.strip().lower()
-    return k.startswith("your_") or "key_here" in k or k == "dummy-key"
-
-
-def _mask_api_key(key: str) -> str:
-    if not key:
-        return "<EMPTY>"
-    k = key.strip()
-    if len(k) <= 8:
-        return k[:2] + "****" + k[-2:]
-    return k[:6] + "..." + k[-4:]
-
+# ===========================================================================
+# Structured LLM gateway (non-streaming)
+# ===========================================================================
 
 async def call_llm_gateway(
     prompt: ChatPromptTemplate,
     params: Dict[str, Any],
-    schema: Type[BaseModel]
+    schema: Type[BaseModel],
 ) -> BaseModel:
-    """Invokes LLM Gateway using strictly configured provider and model name without hardcoded fallbacks."""
-    parser = PydanticOutputParser(pydantic_object=schema)
-    fmt_inst = parser.get_format_instructions()
-    strict_fmt = f"{fmt_inst}\nCRITICAL REQUIREMENT: Return ONLY a raw valid JSON object complying with the schema above. Do NOT output any introductory text, preambles, thinking, or explanations outside the JSON object."
-    formatted_prompt = prompt.partial(format_instructions=strict_fmt)
-    last_error: Optional[Exception] = None
-    max_tokens = getattr(settings, "LLM_MAX_TOKENS", 5000)
-    preferred_provider = (getattr(settings, "LLM_PROVIDER", "") or "").strip().lower()
+    """
+    Invoke the configured LLM provider and parse a structured Pydantic response.
 
-    logger.info(f"[LLM Gateway] Triggered for schema='{schema.__name__}' | Target Provider='{preferred_provider}'")
+    **No provider fallbacks** — uses the single configured provider from
+    the environment. If the call fails, raises ``RuntimeError`` immediately.
 
-    # --- Provider Helpers ---
+    Parameters
+    ----------
+    prompt:
+        LangChain ``ChatPromptTemplate`` with ``{format_instructions}`` variable.
+    params:
+        Template variables to inject into the prompt.
+    schema:
+        Pydantic model class to validate the response against.
 
-    async def try_gemini() -> Optional[BaseModel]:
-        nonlocal last_error
-        gemini_key = (getattr(settings, "GEMINI_API_KEY", "") or "").strip()
-        if _is_placeholder_key(gemini_key):
-            logger.warning("[LLM Gateway] Gemini skipped: Placeholder or missing API key.")
-            return None
-        model_name = (getattr(settings, "GEMINI_MODEL_NAME", "") or getattr(settings, "LLM_MODEL_NAME", "")).strip()
-        if not model_name:
-            logger.warning("[LLM Gateway] Gemini skipped: No model name specified.")
-            return None
+    Returns
+    -------
+    BaseModel
+        Validated instance of ``schema``.
 
-        logger.info(f"[LLM Gateway] Initializing Gemini | Provider: 'gemini' | Model: '{model_name}' | API Key: '{_mask_api_key(gemini_key)}'")
+    Raises
+    ------
+    RuntimeError
+        If the LLM call fails or the response cannot be parsed.
+    ValueError
+        If settings are mis-configured.
+    """
+    fmt_inst = _get_format_instructions(schema)
+    formatted_prompt = prompt.partial(format_instructions=fmt_inst)
 
-        from langchain_google_genai import ChatGoogleGenerativeAI
-        try:
-            gemini_model = ChatGoogleGenerativeAI(
-                model=model_name,
-                google_api_key=gemini_key,
-                temperature=0.2,
-                max_output_tokens=max_tokens
-            )
-            try:
-                chain = formatted_prompt | gemini_model | parser
-                return await chain.ainvoke(params)
-            except Exception as invoke_err:
-                err_str = str(invoke_err)
-                if any(code in err_str for code in ["401", "403", "404", "API_KEY_INVALID", "RESOURCE_EXHAUSTED"]):
-                    raise invoke_err
-                raw_chain = formatted_prompt | gemini_model
-                res = await raw_chain.ainvoke(params)
-                content = res.content if hasattr(res, "content") else str(res)
-                return parse_json_from_llm_response(content, schema)
-        except Exception as e:
-            last_error = e
-            logger.warning(f"[LLM Gateway] Gemini model '{model_name}' failed ({e}).")
-        return None
+    # Resolve config — fail-fast if not configured
+    try:
+        config = llm_config_from_settings(settings)
+    except ValueError as exc:
+        raise RuntimeError(f"LLM configuration error: {exc}") from exc
 
-    async def try_openai() -> Optional[BaseModel]:
-        nonlocal last_error
-        openai_key = (getattr(settings, "OPENAI_API_KEY", "") or "").strip()
-        if _is_placeholder_key(openai_key):
-            logger.warning("[LLM Gateway] OpenAI skipped: Placeholder or missing API key.")
-            return None
-        model_name = (getattr(settings, "OPENAI_MODEL_NAME", "") or getattr(settings, "LLM_MODEL_NAME", "")).strip()
-        if not model_name:
-            logger.warning("[LLM Gateway] OpenAI skipped: No model name specified.")
-            return None
+    # Respect configured max_tokens, capping at 4096 for structured JSON calls
+    structured_max = min(config.max_tokens, 4096)
 
-        base_url = (getattr(settings, "OPENAI_API_BASE", None) or "https://api.openai.com/v1")
-        logger.info(f"[LLM Gateway] Initializing OpenAI | Provider: 'openai' | Model: '{model_name}' | API Key: '{_mask_api_key(openai_key)}' | Base URL: '{base_url}'")
+    # Build the model for this structured call
+    # Use a fresh short-lived client (structured calls, not chat)
+    llm = build_chat_model(
+        type(config)(
+            **{**config.model_dump(), "max_tokens": structured_max, "temperature": 0.2}
+        ),
+        streaming=False,
+    )
 
-        from langchain_openai import ChatOpenAI
-        try:
-            llm = ChatOpenAI(
-                model=model_name,
-                openai_api_key=openai_key,
-                openai_api_base=base_url,
-                temperature=0.2,
-                max_tokens=max_tokens
-            )
-            try:
-                chain = formatted_prompt | llm | parser
-                return await chain.ainvoke(params)
-            except Exception as invoke_err:
-                err_str = str(invoke_err)
-                if any(code in err_str for code in ["401", "402", "403", "404"]):
-                    raise invoke_err
-                raw_chain = formatted_prompt | llm
-                res = await raw_chain.ainvoke(params)
-                content = res.content if hasattr(res, "content") else str(res)
-                return parse_json_from_llm_response(content, schema)
-        except Exception as e:
-            last_error = e
-            logger.warning(f"[LLM Gateway] OpenAI model '{model_name}' failed ({e}).")
-        return None
+    provider_name = config.provider
+    topic_hint = str(params.get("concept_id", "") or params.get("topic", ""))
 
-    async def try_openrouter() -> Optional[BaseModel]:
-        nonlocal last_error
-        openrouter_key = (getattr(settings, "OPENROUTER_API_KEY", "") or "").strip()
-        if _is_placeholder_key(openrouter_key):
-            logger.warning("[LLM Gateway] OpenRouter skipped: Placeholder or missing API key.")
-            return None
-        model_name = (getattr(settings, "OPENROUTER_MODEL_NAME", "") or getattr(settings, "LLM_MODEL_NAME", "")).strip()
-        if not model_name:
-            logger.warning("[LLM Gateway] OpenRouter skipped: No model name specified.")
-            return None
+    logger.info(
+        "[LLM Gateway] Calling '%s' | model='%s' | schema='%s' | max_tokens=%d",
+        provider_name,
+        config.model,
+        schema.__name__,
+        structured_max,
+    )
 
-        logger.info(f"[LLM Gateway] Initializing OpenRouter | Provider: 'openrouter' | Model: '{model_name}' | API Key: '{_mask_api_key(openrouter_key)}'")
+    # Attempt native with_structured_output first if supported by model class
+    try:
+        if hasattr(llm, "with_structured_output"):
+            structured_chain = formatted_prompt | llm.with_structured_output(schema)
+            res = await structured_chain.ainvoke(params)
+            if isinstance(res, schema):
+                logger.info("[LLM Gateway] Native with_structured_output succeeded for %s", schema.__name__)
+                return res
+            if isinstance(res, dict):
+                return _normalize_payload(res, schema, topic_hint=topic_hint)
+    except Exception as exc:
+        logger.debug("[LLM Gateway] Native with_structured_output fallback: %s", exc)
 
-        headers = {
-            "HTTP-Referer": getattr(settings, "APP_URL", "http://localhost:8000"),
-            "X-Title": "Adaptive Learning Platform"
-        }
+    try:
+        rendered_msgs = formatted_prompt.format_prompt(**params).to_messages()
+        rendered_text = "\n---\n".join(f"[{m.type.upper()}]: {m.content}" for m in rendered_msgs)
+    except Exception:
+        rendered_text = str(params)
 
-        try:
-            try:
-                from langchain_openrouter import ChatOpenRouter
-                llm = ChatOpenRouter(
-                    model=model_name,
-                    openrouter_api_key=openrouter_key,
-                    temperature=0.2,
-                    max_tokens=max_tokens,
-                )
-            except ImportError:
-                from langchain_openai import ChatOpenAI
-                llm = ChatOpenAI(
-                    model=model_name,
-                    openai_api_key=openrouter_key,
-                    openai_api_base="https://openrouter.ai/api/v1",
-                    default_headers=headers,
-                    temperature=0.2,
-                    max_tokens=max_tokens
-                )
+    logger.info("[LLM Gateway] Prompt (schema=%s):\n%s", schema.__name__, rendered_text[:1000])
 
-            try:
-                chain = formatted_prompt | llm | parser
-                return await chain.ainvoke(params)
-            except Exception as invoke_err:
-                err_str = str(invoke_err)
-                if any(code in err_str for code in ["401", "402", "403", "404"]):
-                    raise invoke_err
-                raw_chain = formatted_prompt | llm
-                res = await raw_chain.ainvoke(params)
-                content = res.content if hasattr(res, "content") else str(res)
-                return parse_json_from_llm_response(content, schema)
-        except Exception as e:
-            last_error = e
-            logger.warning(f"[LLM Gateway] OpenRouter model '{model_name}' failed ({e}).")
-        return None
+    chain = formatted_prompt | llm
+    t0 = time.monotonic()
+    try:
+        res = await chain.ainvoke(params)
+    except Exception as exc:
+        raise RuntimeError(
+            f"LLM provider '{provider_name}' failed for schema '{schema.__name__}': {exc}"
+        ) from exc
 
-    async def try_groq() -> Optional[BaseModel]:
-        nonlocal last_error
-        groq_key = (getattr(settings, "GROQ_API_KEY", "") or "").strip()
-        if _is_placeholder_key(groq_key):
-            logger.warning("[LLM Gateway] Groq skipped: Placeholder or missing API key.")
-            return None
-        model_name = (getattr(settings, "GROQ_MODEL_NAME", "") or getattr(settings, "LLM_MODEL_NAME", "")).strip()
-        if not model_name:
-            logger.warning("[LLM Gateway] Groq skipped: No model name specified.")
-            return None
+    elapsed_ms = int((time.monotonic() - t0) * 1000)
+    content = res.content if hasattr(res, "content") else str(res)
 
-        logger.info(f"[LLM Gateway] Initializing Groq | Provider: 'groq' | Model: '{model_name}' | API Key: '{_mask_api_key(groq_key)}'")
+    if isinstance(content, list):
+        content = "\n".join(
+            b if isinstance(b, str) else b.get("text", "") or b.get("content", "")
+            for b in content
+        )
+    elif not isinstance(content, str):
+        content = str(content)
 
-        from langchain_groq import ChatGroq
-        try:
-            groq_model = ChatGroq(
-                model_name=model_name,
-                groq_api_key=groq_key,
-                temperature=0.2,
-                max_tokens=max_tokens
-            )
-            try:
-                fallback_chain = formatted_prompt | groq_model | parser
-                return await fallback_chain.ainvoke(params)
-            except Exception as invoke_err:
-                err_str = str(invoke_err)
-                if any(code in err_str for code in ["401", "403", "404", "model_decommissioned", "model_not_found"]):
-                    raise invoke_err
-                raw_chain = formatted_prompt | groq_model
-                res = await raw_chain.ainvoke(params)
-                content = res.content if hasattr(res, "content") else str(res)
-                return parse_json_from_llm_response(content, schema)
-        except Exception as e:
-            last_error = e
-            logger.warning(f"[LLM Gateway] Groq model '{model_name}' failed ({e}).")
-        return None
+    logger.info(
+        "[LLM Gateway] ⏱ %dms | schema='%s' | chars=%d",
+        elapsed_ms,
+        schema.__name__,
+        len(content),
+    )
+    logger.debug("[LLM Gateway] Raw response:\n%s", content[:1500])
 
-    async def try_custom() -> Optional[BaseModel]:
-        """Custom provider for OpenAI-compatible gateways (e.g. vLLM, Ollama, LocalAI, NVIDIA NIM)."""
-        nonlocal last_error
-        import os
-
-        url_candidate = getattr(settings, "CUSTOM_BASE_URL", "") or getattr(settings, "CUSTOM_API_BASE", "") or os.getenv("CUSTOM_BASE_URL", "") or os.getenv("CUSTOM_API_BASE", "")
-        key_candidate = getattr(settings, "CUSTOM_API_KEY", "") or os.getenv("CUSTOM_API_KEY", "")
-
-        # If url_candidate is not a valid URL (e.g. key was passed in CUSTOM_API_BASE), fix it
-        if url_candidate and not url_candidate.startswith("http"):
-            if not key_candidate or _is_placeholder_key(key_candidate):
-                key_candidate = url_candidate
-            url_candidate = getattr(settings, "CUSTOM_BASE_URL", "") if getattr(settings, "CUSTOM_BASE_URL", "").startswith("http") else ""
-
-        base_url = url_candidate.strip()
-        if not base_url or not base_url.startswith("http"):
-            logger.warning("[LLM Gateway] Custom skipped: Invalid or missing Base URL (must start with http:// or https://).")
-            return None
-
-        api_key = (key_candidate or "dummy-key").strip()
-        model_name = (getattr(settings, "CUSTOM_MODEL_NAME", "") or getattr(settings, "LLM_MODEL_NAME", "")).strip()
-        if not model_name:
-            logger.warning("[LLM Gateway] Custom skipped: No model name specified.")
-            return None
-
-        logger.info(f"[LLM Gateway] Initializing Custom | Provider: 'custom' | Model: '{model_name}' | API Key: '{_mask_api_key(api_key)}' | Base URL: '{base_url}'")
-
-        from langchain_openai import ChatOpenAI
-        topic_hint = str(params.get("topic", ""))
-
-        # 1. Attempt json_object mode via model_kwargs if supported by endpoint/NIM
-        try:
-            llm_json = ChatOpenAI(
-                model=model_name,
-                openai_api_key=api_key,
-                openai_api_base=base_url,
-                temperature=0.2,
-                max_tokens=max_tokens,
-                request_timeout=25.0,
-                model_kwargs={"response_format": {"type": "json_object"}}
-            )
-            raw_chain = formatted_prompt | llm_json
-            res = await raw_chain.ainvoke(params)
-            content = res.content if hasattr(res, "content") else str(res)
-            return parse_json_from_llm_response(content, schema, topic_hint=topic_hint)
-        except Exception as json_mode_err:
-            logger.debug(f"[LLM Gateway] Custom json_object mode fallback ({json_mode_err}), trying standard ChatOpenAI...")
-
-        # 2. Standard ChatOpenAI call with Pydantic parser & multi-stage JSON extractor
-        try:
-            llm = ChatOpenAI(
-                model=model_name,
-                openai_api_key=api_key,
-                openai_api_base=base_url,
-                temperature=0.2,
-                max_tokens=max_tokens,
-                request_timeout=25.0
-            )
-            try:
-                chain = formatted_prompt | llm | parser
-                return await chain.ainvoke(params)
-            except Exception as invoke_err:
-                err_str = str(invoke_err)
-                if any(code in err_str for code in ["401", "402", "403", "404"]):
-                    raise invoke_err
-                raw_chain = formatted_prompt | llm
-                res = await raw_chain.ainvoke(params)
-                content = res.content if hasattr(res, "content") else str(res)
-                return parse_json_from_llm_response(content, schema, topic_hint=topic_hint)
-        except Exception as e:
-            last_error = e
-            logger.warning(f"[LLM Gateway] Custom LLM model '{model_name}' at endpoint '{base_url}' failed: {e}")
-        return None
+    try:
+        return parse_json_from_llm_response(content, schema, topic_hint=topic_hint)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"LLM response for schema '{schema.__name__}' could not be parsed: {exc}"
+        ) from exc
 
 
-    # --- Match / Switch Case Selection ---
+# ===========================================================================
+# Streaming text gateway
+# ===========================================================================
 
-    match preferred_provider:
-        case "openai":
-            primary_func = try_openai
-        case "openrouter":
-            primary_func = try_openrouter
-        case "gemini":
-            primary_func = try_gemini
-        case "groq":
-            primary_func = try_groq
-        case "custom":
-            primary_func = try_custom
-        case _:
-            primary_func = None
+async def call_llm_gateway_stream(
+    prompt: ChatPromptTemplate,
+    params: Dict[str, Any],
+    schema: Optional[Type[BaseModel]] = None,
+):
+    """
+    Async generator yielding text token delta strings from the configured LLM.
 
-    all_funcs = [try_gemini, try_groq, try_openai, try_openrouter, try_custom]
-    if primary_func:
-        execution_order = [primary_func] + [f for f in all_funcs if f != primary_func]
+    Parameters
+    ----------
+    prompt : ChatPromptTemplate
+        Prompt to send to LLM.
+    params : Dict[str, Any]
+        Variables to format into the prompt.
+    schema : Optional[Type[BaseModel]], default None
+        Optional Pydantic schema for structured generation. If None, performs
+        pure text streaming (Markdown / conversational text) without whole-document schema.
+
+    **No provider fallbacks** — uses the single configured provider.
+
+    Raises
+    ------
+    RuntimeError
+        If the LLM call fails.
+    """
+    if schema is not None:
+        fmt_inst = _get_format_instructions(schema)
+        if "format_instructions" in prompt.input_variables:
+            formatted_prompt = prompt.partial(format_instructions=fmt_inst)
+        else:
+            formatted_prompt = prompt
     else:
-        execution_order = all_funcs
+        if "format_instructions" in prompt.input_variables:
+            formatted_prompt = prompt.partial(format_instructions="")
+        else:
+            formatted_prompt = prompt
 
-    for func in execution_order:
-        res = await func()
-        if res is not None:
-            return res
 
-    provider_desc = preferred_provider if preferred_provider else "configured"
-    err_detail = f"Details: {last_error}" if last_error else f"No valid API key or endpoint configured for provider '{provider_desc}'."
-    raise RuntimeError(f"LLM Provider '{provider_desc}' failed for schema '{schema.__name__}'. {err_detail}")
+    try:
+        config = llm_config_from_settings(settings)
+    except ValueError as exc:
+        raise RuntimeError(f"LLM configuration error: {exc}") from exc
+
+    safe_max = min(config.max_tokens, 4096)
+
+    llm = build_chat_model(
+        type(config)(
+            **{**config.model_dump(), "max_tokens": safe_max, "temperature": 0.2}
+        ),
+        streaming=True,
+    )
+
+    logger.info(
+        "[LLM Gateway Stream] Starting stream | provider='%s' | model='%s'",
+        config.provider,
+        config.model,
+    )
+
+    chain = formatted_prompt | llm
+    chunk_count = 0
+    try:
+        async for chunk in chain.astream(params):
+            norm = StreamEventNormalizer.normalize_chunk(chunk)
+            if norm.text:
+                chunk_count += 1
+                yield norm.text
+    except Exception as exc:
+        raise RuntimeError(
+            f"LLM streaming provider '{config.provider}' failed: {exc}"
+        ) from exc
+
+    if chunk_count == 0:
+        raise RuntimeError(
+            f"LLM provider '{config.provider}' returned no streaming content."
+        )

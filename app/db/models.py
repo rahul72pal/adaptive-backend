@@ -62,6 +62,7 @@ class User(Base):
     diagnostic_sessions = relationship("DiagnosticSession", back_populates="user", cascade="all, delete-orphan")
     concept_mastery = relationship("ConceptMastery", back_populates="user", cascade="all, delete-orphan")
     attempts = relationship("Attempt", back_populates="user", cascade="all, delete-orphan")
+    user_topics = relationship("UserTopic", back_populates="user", cascade="all, delete-orphan")
 
 class DiagnosticSession(Base):
     __tablename__ = "diagnostic_sessions"
@@ -103,6 +104,22 @@ class Attempt(Base):
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
     user = relationship("User", back_populates="attempts")
+
+class UserTopic(Base):
+    __tablename__ = "user_topics"
+
+    id = Column(UUIDType, primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUIDType, ForeignKey("users.id"), nullable=False, index=True)
+    topic_slug = Column(String, nullable=False, index=True)
+    canonical_topic = Column(String, nullable=False)
+    current_level = Column(String, nullable=False, default="beginner")
+    status = Column(String, nullable=False, default="active")
+    completed_nodes = Column(JSONType, nullable=False, default=list)
+    completed_node_ids = Column(JSONType, nullable=False, default=list)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+    user = relationship("User", back_populates="user_topics")
 
 # ==========================================
 # 2. MONGODB DOCUMENT SCHEMAS (Pydantic)

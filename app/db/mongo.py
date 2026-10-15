@@ -35,6 +35,13 @@ class InMemoryMongoFallback:
             self._store[str(doc_id)] = doc
             return type("InsertResult", (), {"inserted_id": doc_id})()
 
+        async def insert_many(self, docs: list):
+            inserted_ids = []
+            for doc in docs:
+                res = await self.insert_one(doc)
+                inserted_ids.append(res.inserted_id)
+            return type("InsertManyResult", (), {"inserted_ids": inserted_ids})()
+
         async def update_one(self, filter_dict: dict, update_dict: dict, upsert: bool = False):
             existing = await self.find_one(filter_dict)
             if existing:
@@ -47,6 +54,35 @@ class InMemoryMongoFallback:
                     new_doc.update(update_dict["$set"])
                 return await self.insert_one(new_doc)
             return None
+
+        async def delete_one(self, filter_dict: dict):
+            target_key = None
+            for key, doc in list(self._store.items()):
+                match = True
+                for k, v in filter_dict.items():
+                    if doc.get(k) != v:
+                        match = False
+                        break
+                if match:
+                    target_key = key
+                    break
+            if target_key:
+                del self._store[target_key]
+                return type("DeleteResult", (), {"deleted_count": 1})()
+            return type("DeleteResult", (), {"deleted_count": 0})()
+
+        async def delete_many(self, filter_dict: dict):
+            deleted_count = 0
+            for key, doc in list(self._store.items()):
+                match = True
+                for k, v in filter_dict.items():
+                    if doc.get(k) != v:
+                        match = False
+                        break
+                if match:
+                    del self._store[key]
+                    deleted_count += 1
+            return type("DeleteResult", (), {"deleted_count": deleted_count})()
 
         def find(self, filter_dict: dict):
             results = []
@@ -118,6 +154,16 @@ class ResilientMongoDatabase:
                 self._parent._use_fallback = True
                 return await self._fallback_coll.insert_one(doc)
 
+        async def insert_many(self, docs: list):
+            if self._parent._use_fallback:
+                return await self._fallback_coll.insert_many(docs)
+            try:
+                return await self._real_coll.insert_many(docs)
+            except Exception as e:
+                logger.warning(f"MongoDB insert_many failed ({e}). Switching to in-memory fallback...")
+                self._parent._use_fallback = True
+                return await self._fallback_coll.insert_many(docs)
+
         async def update_one(self, filter_dict: dict, update_dict: dict, upsert: bool = False):
             if self._parent._use_fallback:
                 return await self._fallback_coll.update_one(filter_dict, update_dict, upsert)
@@ -127,6 +173,26 @@ class ResilientMongoDatabase:
                 logger.warning(f"MongoDB update failed ({e}). Switching to in-memory fallback...")
                 self._parent._use_fallback = True
                 return await self._fallback_coll.update_one(filter_dict, update_dict, upsert)
+
+        async def delete_one(self, filter_dict: dict):
+            if self._parent._use_fallback:
+                return await self._fallback_coll.delete_one(filter_dict)
+            try:
+                return await self._real_coll.delete_one(filter_dict)
+            except Exception as e:
+                logger.warning(f"MongoDB delete_one failed ({e}). Switching to in-memory fallback...")
+                self._parent._use_fallback = True
+                return await self._fallback_coll.delete_one(filter_dict)
+
+        async def delete_many(self, filter_dict: dict):
+            if self._parent._use_fallback:
+                return await self._fallback_coll.delete_many(filter_dict)
+            try:
+                return await self._real_coll.delete_many(filter_dict)
+            except Exception as e:
+                logger.warning(f"MongoDB delete_many failed ({e}). Switching to in-memory fallback...")
+                self._parent._use_fallback = True
+                return await self._fallback_coll.delete_many(filter_dict)
 
         def find(self, filter_dict: dict):
             if self._parent._use_fallback:

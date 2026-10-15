@@ -1,7 +1,7 @@
 import sympy
 import httpx
 import logging
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from app.llm.gateway import call_llm_gateway
 from app.llm.prompts import EVALUATION_RUBRIC_PROMPT
 from app.llm.schemas import RubricEvaluationSchema
@@ -10,7 +10,10 @@ logger = logging.getLogger(__name__)
 
 async def evaluate_user_attempt(
     question_doc: Dict[str, Any],
-    user_answer: str
+    user_answer: str,
+    test_run_count: int = 0,
+    test_cases_passed: Optional[int] = None,
+    total_test_cases: Optional[int] = None
 ) -> Dict[str, Any]:
     """Evaluates user's answer using multi-signal grading (Deterministic Sandbox/SymPy + LLM Rubric)."""
     q_type = question_doc.get("type", "mcq")
@@ -19,8 +22,8 @@ async def evaluate_user_attempt(
     
     execution_score = 1.0
     execution_feedback = "N/A"
-    test_cases_passed = 0
-    total_test_cases = 0
+    tc_passed = 0
+    tc_total = 0
 
     # 1. Deterministic Auto-Gradable Types (MCQ / True-False)
     if q_type in ["mcq", "true_false"]:
@@ -34,7 +37,8 @@ async def evaluate_user_attempt(
                 "correct": is_correct,
                 "submitted_answer": user_answer,
                 "expected_answer": question_doc.get("correct_option"),
-                "method": "exact_match"
+                "method": "exact_match",
+                "test_run_count": test_run_count
             }
         }
 
@@ -52,7 +56,8 @@ async def evaluate_user_attempt(
                 "correct": final_score == 1.0,
                 "submitted_answer": user_answer,
                 "expected_answer": question_doc.get("expected_answer"),
-                "method": "string_match"
+                "method": "string_match",
+                "test_run_count": test_run_count
             }
         }
 
@@ -84,55 +89,70 @@ async def evaluate_user_attempt(
                 execution_score = 0.5
                 execution_feedback = f"Could not parse math expression symbolically: {e}"
 
-    # 4. Code Execution (Piston API / Simulated Sandbox Test Cases)
-    elif concept_type == "code" or execution_method == "piston_api":
-        test_cases = question_doc.get("test_cases") or []
-        total_test_cases = len(test_cases)
-        
-        if total_test_cases > 0:
-            passed = 0
-            for tc in test_cases:
-                # Basic code execution check: verify if output pattern or key statement is present
-                expected_out = str(tc.get("expected_output", "")).strip()
-                if expected_out in user_answer or "return" in user_answer or "def " in user_answer or "const " in user_answer:
-                    passed += 1
-            test_cases_passed = passed
-            execution_score = passed / total_test_cases
-            execution_feedback = f"Passed {passed}/{total_test_cases} test cases."
+    # 4. Code Execution (Use client browser runtime metrics if provided, else fallback to sandbox)
+    elif concept_type == "code" or q_type == "practice" or execution_method in ["piston_api", "browser_compiler"]:
+        if test_cases_passed is not None and total_test_cases is not None and total_test_cases > 0:
+            tc_total = total_test_cases
+            tc_passed = min(test_cases_passed, tc_total)
+            execution_score = round(tc_passed / tc_total, 4)
+            execution_feedback = f"Passed {tc_passed}/{tc_total} test cases in browser execution after {test_run_count} test run(s)."
         else:
-            execution_score = 1.0 if len(user_answer) > 15 else 0.4
-            execution_feedback = "No explicit test cases provided; basic code structure verified."
+            test_cases = question_doc.get("test_cases") or []
+            tc_total = len(test_cases)
+            if tc_total > 0:
+                passed = 0
+                for tc in test_cases:
+                    expected_out = str(tc.get("expected_output", "")).strip()
+                    if expected_out in user_answer or "return" in user_answer or "def " in user_answer or "const " in user_answer:
+                        passed += 1
+                tc_passed = passed
+                execution_score = round(passed / tc_total, 4)
+                execution_feedback = f"Passed {passed}/{tc_total} test cases."
+            else:
+                execution_score = 1.0 if len(user_answer) > 15 else 0.4
+                execution_feedback = "No explicit test cases provided; basic code structure verified."
+
 
     # 5. LLM Secondary Rubric Evaluation
-    res = await call_llm_gateway(
-        EVALUATION_RUBRIC_PROMPT,
-        {
-            "concept_id": question_doc.get("concept_id", "concept"),
-            "question": question_doc.get("question", ""),
-            "rubric": question_doc.get("rubric") or question_doc.get("expected_answer", "Correct implementation required"),
-            "expected_time_complexity": question_doc.get("expected_time_complexity") or "N/A",
-            "expected_space_complexity": question_doc.get("expected_space_complexity") or "N/A",
-            "answer": user_answer,
-            "execution_feedback": execution_feedback
-        },
-        RubricEvaluationSchema
-    )
+    llm_quality_score = execution_score
+    llm_feedback = execution_feedback
+    conceptual_breakdown = {}
+
+    try:
+        res = await call_llm_gateway(
+            EVALUATION_RUBRIC_PROMPT,
+            {
+                "concept_id": question_doc.get("concept_id", "concept"),
+                "question": question_doc.get("question", ""),
+                "rubric": question_doc.get("rubric") or question_doc.get("expected_answer", "Correct implementation required"),
+                "expected_time_complexity": question_doc.get("expected_time_complexity") or "N/A",
+                "expected_space_complexity": question_doc.get("expected_space_complexity") or "N/A",
+                "answer": user_answer,
+                "execution_feedback": execution_feedback
+            },
+            RubricEvaluationSchema
+        )
+        llm_quality_score = getattr(res, "llm_quality_score", execution_score)
+        llm_feedback = getattr(res, "feedback", execution_feedback)
+        conceptual_breakdown = getattr(res, "conceptual_breakdown", {})
+    except Exception as llm_err:
+        logger.warning(f"[evaluate_user_attempt] LLM Rubric evaluation warning ({llm_err}). Falling back to execution_score.")
 
     # 6. Final Multi-Signal Weighted Calculation: 70% Execution + 30% LLM Rubric
     if q_type == "practice":
-        final_score = round((0.7 * execution_score) + (0.3 * res.llm_quality_score), 4)
+        final_score = round((0.7 * execution_score) + (0.3 * llm_quality_score), 4)
     else:
-        final_score = round(res.llm_quality_score, 4)
+        final_score = round(llm_quality_score, 4)
 
     return {
         "score": final_score,
         "evaluation_breakdown": {
             "execution_score": execution_score,
-            "llm_quality_score": res.llm_quality_score,
+            "llm_quality_score": llm_quality_score,
             "execution_feedback": execution_feedback,
-            "llm_feedback": res.feedback,
+            "llm_feedback": llm_feedback,
             "test_cases_passed": test_cases_passed,
             "total_test_cases": total_test_cases,
-            "conceptual_breakdown": res.conceptual_breakdown
+            "conceptual_breakdown": conceptual_breakdown
         }
     }
