@@ -270,6 +270,74 @@ def llm_config_from_settings(settings_obj: object) -> Union[OpenAIConfig, Gemini
     raise ValueError(f"Unhandled provider: {provider}")
 
 
+def llm_config_from_dict(d: dict) -> Union[OpenAIConfig, GeminiConfig, AnthropicConfig, OpenRouterConfig, CustomConfig]:
+    """Build a validated config from a user-supplied dict (DB row / request).
+
+    Raises ``ValueError`` on missing or invalid fields so callers can surface a
+    400 rather than silently falling back to server credentials.
+    """
+    provider_raw = str(d.get("provider") or d.get("config_type") or "openai").strip().lower()
+    # ``openai-compatible`` is accepted as an alias for the custom provider.
+    if provider_raw == "openai-compatible":
+        provider_raw = "custom"
+
+    try:
+        provider = LLMProvider(provider_raw)
+    except ValueError:
+        supported = ", ".join(p.value for p in LLMProvider)
+        raise ValueError(f"Unsupported provider='{provider_raw}'. Supported: {supported}")
+
+    api_key = str(d.get("api_key") or "").strip()
+    model = str(d.get("model") or d.get("default_model") or "").strip()
+    base_url = str(d.get("base_url") or "").strip() or None
+    try:
+        temperature = float(d.get("temperature", 0.7))
+    except (TypeError, ValueError):
+        temperature = 0.7
+    try:
+        max_tokens = int(d.get("max_tokens", 4096))
+    except (TypeError, ValueError):
+        max_tokens = 4096
+
+    if provider != LLMProvider.CUSTOM and not api_key:
+        raise ValueError("api_key is required in the user LLM configuration.")
+    if not model:
+        raise ValueError("model is required in the user LLM configuration.")
+
+    if provider == LLMProvider.OPENAI:
+        return OpenAIConfig(
+            api_key=api_key,
+            model=model,
+            base_url=base_url or "https://api.openai.com/v1",
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+    if provider == LLMProvider.GEMINI:
+        return GeminiConfig(api_key=api_key, model=model, temperature=temperature, max_tokens=max_tokens)
+    if provider == LLMProvider.ANTHROPIC:
+        return AnthropicConfig(api_key=api_key, model=model, temperature=temperature, max_tokens=max_tokens)
+    if provider == LLMProvider.OPENROUTER:
+        return OpenRouterConfig(
+            api_key=api_key,
+            model=model,
+            base_url=base_url or "https://openrouter.ai/api/v1",
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+    if provider == LLMProvider.CUSTOM:
+        if not base_url:
+            raise ValueError("Custom LLM configuration requires 'base_url'.")
+        return CustomConfig(
+            api_key=api_key or "dummy-key",
+            model=model,
+            base_url=base_url,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+
+    raise ValueError(f"Unhandled provider: {provider}")
+
+
 # ---------------------------------------------------------------------------
 # Helpers (module-private)
 # ---------------------------------------------------------------------------

@@ -14,6 +14,8 @@ from app.api.learning import router as learning_router
 from app.api.questions import router as questions_router
 from app.api.progress import router as progress_router
 from app.api.topics import router as topics_router
+from app.api.llm_config import router as llm_config_router
+from app.api.code import router as code_router
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("adaptive_backend")
@@ -62,6 +64,8 @@ app.include_router(learning_router)
 app.include_router(questions_router)
 app.include_router(progress_router)
 app.include_router(topics_router)
+app.include_router(llm_config_router)
+app.include_router(code_router)
 
 @app.get("/health", tags=["Health Check"])
 async def health_check():

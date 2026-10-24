@@ -54,10 +54,13 @@ from app.llm.config import (
     CustomConfig,
     GeminiConfig,
     OpenAIConfig,
+    OpenRouterConfig,
+    llm_config_from_dict,
     llm_config_from_settings,
     mask_api_key,
 )
 from app.llm.providers import build_chat_model
+from app.llm.user_context import get_active_llm_config
 from app.utils.exceptions import DeepSeekAPIException
 from app.utils.tool import document_search, reset_search_counter, web_search
 from app.services.prompt_service import PromptService
@@ -259,7 +262,7 @@ class AgentService:
 
     def _resolve_llm_config(
         self, llm_config: Optional[Dict[str, Any]] = None
-    ) -> Union[OpenAIConfig, GeminiConfig, AnthropicConfig, CustomConfig]:
+    ) -> Union[OpenAIConfig, GeminiConfig, AnthropicConfig, OpenRouterConfig, CustomConfig]:
         """
         Build a typed ``LLMConfig`` from:
           1. A per-request ``llm_config`` dict (user-supplied model override), or
@@ -268,9 +271,9 @@ class AgentService:
         Raises ``DeepSeekAPIException`` with HTTP 400 if configuration is missing
         or invalid — fail-fast, no silent fallbacks.
         """
-        if llm_config and llm_config.get("api_key"):
-            # Per-request user config — build from dict
-            return self._build_config_from_dict(llm_config)
+        effective = llm_config or get_active_llm_config()
+        if effective and effective.get("api_key"):
+            return self._build_config_from_dict(effective)
 
         # Fall back to env / settings
         try:
@@ -284,44 +287,12 @@ class AgentService:
 
     def _build_config_from_dict(
         self, d: Dict[str, Any]
-    ) -> Union[OpenAIConfig, GeminiConfig, AnthropicConfig, CustomConfig]:
+    ) -> Union[OpenAIConfig, GeminiConfig, AnthropicConfig, OpenRouterConfig, CustomConfig]:
         """Build a typed LLMConfig from a user-supplied dict."""
-        provider_raw = (d.get("provider") or d.get("config_type") or "openai").lower().strip()
-        api_key = (d.get("api_key") or "").strip()
-        model = (
-            d.get("model") or d.get("default_model") or ""
-        ).strip()
-        temperature = float(d.get("temperature") or 0.7)
-        max_tokens = int(d.get("max_tokens") or 4096)
-
-        if not api_key:
-            raise DeepSeekAPIException(message="api_key missing in user LLM configuration.", status_code=400)
-        if not model:
-            raise DeepSeekAPIException(message="model missing in user LLM configuration.", status_code=400)
-
-        if provider_raw == "openai":
-            return OpenAIConfig(
-                api_key=api_key,
-                model=model,
-                base_url=d.get("base_url") or "https://api.openai.com/v1",
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-        if provider_raw == "gemini":
-            return GeminiConfig(api_key=api_key, model=model, temperature=temperature, max_tokens=max_tokens)
-        if provider_raw == "anthropic":
-            return AnthropicConfig(api_key=api_key, model=model, temperature=temperature, max_tokens=max_tokens)
-        if provider_raw in ("custom", "openai-compatible"):
-            base_url = d.get("base_url") or ""
-            if not base_url:
-                raise DeepSeekAPIException(
-                    message="Custom LLM requires 'base_url'.", status_code=400
-                )
-            return CustomConfig(api_key=api_key, model=model, base_url=base_url, temperature=temperature, max_tokens=max_tokens)
-
-        raise DeepSeekAPIException(
-            message=f"Unsupported provider '{provider_raw}'.", status_code=400
-        )
+        try:
+            return llm_config_from_dict(d)
+        except ValueError as exc:
+            raise DeepSeekAPIException(message=str(exc), status_code=400) from exc
 
     def _get_llm_model(
         self,
@@ -901,9 +872,14 @@ async def call_llm_gateway(
     fmt_inst = _get_format_instructions(schema)
     formatted_prompt = prompt.partial(format_instructions=fmt_inst)
 
-    # Resolve config — fail-fast if not configured
+    # Resolve config — prefer the logged-in user's saved config, else env
     try:
-        config = llm_config_from_settings(settings)
+        user_config = get_active_llm_config()
+        config = (
+            llm_config_from_dict(user_config)
+            if user_config and user_config.get("api_key")
+            else llm_config_from_settings(settings)
+        )
     except ValueError as exc:
         raise RuntimeError(f"LLM configuration error: {exc}") from exc
 
@@ -1030,7 +1006,12 @@ async def call_llm_gateway_stream(
 
 
     try:
-        config = llm_config_from_settings(settings)
+        user_config = get_active_llm_config()
+        config = (
+            llm_config_from_dict(user_config)
+            if user_config and user_config.get("api_key")
+            else llm_config_from_settings(settings)
+        )
     except ValueError as exc:
         raise RuntimeError(f"LLM configuration error: {exc}") from exc
 

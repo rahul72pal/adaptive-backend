@@ -1,6 +1,7 @@
 import uuid
-from typing import Optional, Any, List
+from typing import Optional, Any, Dict, List
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel, Field
 
@@ -45,6 +46,7 @@ class SubmitAttemptSchema(BaseModel):
     total_test_cases: Optional[int] = Field(default=None, ge=0)
     language: Optional[str] = "python"
     explanation_language: Optional[str] = "english"
+    include_next_question: bool = False
 
 
 import json
@@ -54,101 +56,191 @@ from fastapi.responses import StreamingResponse
 
 logger = logging.getLogger(__name__)
 
+def _sse(payload: dict) -> str:
+    return f"data: {json.dumps({k: v for k, v in payload.items() if v is not None})}\n\n"
+
+
 async def stream_question_generator(payload: GenerateQuestionSchema, mongo_db: Any):
-    from app.engine.question_engine import get_or_generate_question, sanitize_question_for_client, DIFFICULTY_DESCRIPTIONS
-    from app.llm.gateway import call_llm_gateway_stream, parse_json_from_llm_response
-    from app.llm.prompts import QUESTION_GEN_PROMPT
-    from app.llm.schemas import QuestionBatchSchema
+    """Split question pipeline as a tool-event stream.
 
-    topic_clean = payload.topic.lower().strip()
-    concept_id = payload.concept_id.strip()
-    concept_type = payload.concept_type.strip()
-    difficulty = payload.difficulty
+    Events
+    ------
+    message_start → tool_start(question_text) → token* → tool_end
+    → question_ready → [tool_start(code_and_tests) → meta → test_cases → tool_end]
+    → complete | cached | error
+    """
+    from app.engine.question_engine import (
+        build_question_doc,
+        generate_question_meta,
+        generate_test_cases,
+        sanitize_question_for_client,
+        question_kind_for,
+        _find_cached_question,
+    )
+    from app.llm.gateway import call_llm_gateway_stream
+    from app.llm.prompts import QUESTION_STATEMENT_PROMPT
+    from app.llm.schemas import QuestionTextSchema
 
-    # 1. Check MongoDB cache first for immediate cached response
-    if mongo_db is not None:
-        try:
-            q_col = mongo_db.get_collection("questions")
-            query = {
-                "topic": topic_clean,
-                "concept_id": concept_id,
-                "difficulty": difficulty
-            }
-            if concept_type:
-                query["concept_type"] = concept_type
+    topic_clean = (payload.topic or "").lower().strip()
+    concept_id = (payload.concept_id or "").strip()
+    concept_type = (payload.concept_type or "conceptual").strip().lower()
+    difficulty = int(payload.difficulty or 3)
+    language = (payload.language or "python").lower().strip()
+    explanation_language = (payload.explanation_language or "english").lower().strip()
+    question_kind = question_kind_for(concept_type)
+    is_code = question_kind == "practice" or concept_type in ("code", "practice")
 
-            cached_docs = await q_col.find(query).to_list(10)
-            if cached_docs:
-                doc = random.choice(cached_docs)
-                safe_q = sanitize_question_for_client(doc)
-                yield f"data: {json.dumps({'event': 'cached', 'question': safe_q, 'markdown': safe_q.get('markdown', '')})}\n\n"
-                return
-        except Exception as e:
-            logger.warning(f"[stream_question_generator] Cache check warning: {e}")
+    q_collection = mongo_db.get_collection("questions") if mongo_db is not None else None
 
-    # 2. Stream tokens live from LLM
-    yield f"data: {json.dumps({'event': 'start', 'status': 'generating'})}\n\n"
-    diff_desc = DIFFICULTY_DESCRIPTIONS.get(difficulty, "standard conceptual understanding")
-    full_tokens = []
+    # 1. Warm cache → instant response
+    cached = await _find_cached_question(
+        concept_id, topic_clean, difficulty, concept_type, q_collection
+    )
+    if cached:
+        safe_q = sanitize_question_for_client(dict(cached))
+        yield _sse({
+            "event": "cached",
+            "question": safe_q,
+            "markdown": safe_q.get("markdown", ""),
+            "tool": "question_text",
+        })
+        return
 
+    yield _sse({"event": "message_start", "concept_id": concept_id, "difficulty": difficulty})
+
+    # 2. Tool 1 — stream the statement only (fast, no JSON)
+    yield _sse({"event": "tool_start", "tool": "question_text", "concept_id": concept_id})
+    statement_chunks: List[str] = []
+    stream_error: Optional[str] = None
     try:
-        async for chunk_text in call_llm_gateway_stream(
-            QUESTION_GEN_PROMPT,
+        async for delta in call_llm_gateway_stream(
+            QUESTION_STATEMENT_PROMPT,
             {
                 "topic": topic_clean,
                 "concept_id": concept_id,
-                "pattern": "none",
                 "concept_type": concept_type,
                 "difficulty": difficulty,
-                "difficulty_description": diff_desc,
-                "question_type": "practice" if concept_type == "code" else "mcq",
-                "count": 1,
-                "previous_question_titles": "None"
-            },
-            QuestionBatchSchema
+                "question_type": question_kind,
+                "language": language,
+                "explanation_language": explanation_language,
+            }
         ):
-            full_tokens.append(chunk_text)
-            yield f"data: {json.dumps({'event': 'token', 'delta': chunk_text})}\n\n"
+            statement_chunks.append(delta)
+            yield _sse({"event": "token", "delta": delta})
+    except Exception as stream_err:
+        stream_error = str(stream_err) or stream_err.__class__.__name__
+        logger.error(
+            "[stream_question_generator] Statement stream failed for '%s': %s",
+            concept_id, stream_error, exc_info=True,
+        )
 
-        raw_json_str = "".join(full_tokens)
-        parsed = parse_json_from_llm_response(raw_json_str, QuestionBatchSchema, topic_hint=concept_id)
-        
-        raw_questions = getattr(parsed, "questions", [])
-        if not raw_questions:
-            fallback_q = await get_or_generate_question(topic_clean, concept_id, concept_type, difficulty, mongo_db)
-            yield f"data: {json.dumps({'event': 'complete', 'question': fallback_q, 'markdown': fallback_q.get('markdown', '')})}\n\n"
-            return
+    statement = "".join(statement_chunks).strip()
+    if not statement:
+        # Never fake a statement: a placeholder would hide a real provider or
+        # credential failure (bad/expired API key, provider that does not
+        # stream) behind a question with no content. Report the reason instead
+        # so the UI can show it; the client then falls back to the blocking
+        # endpoint, which surfaces its own error if that also fails.
+        yield _sse({
+            "event": "error",
+            "message": (
+                f"Question generation failed: {stream_error}"
+                if stream_error
+                else "The model returned no content for this question."
+            ),
+        })
+        return
 
-        q_item = raw_questions[0]
-        q_dict = q_item.model_dump() if hasattr(q_item, "model_dump") else dict(q_item)
-
-        q_id = f"q_{uuid.uuid4().hex[:8]}"
-        q_doc = {
-            "_id": q_id,
-            "id": q_id,
-            "topic": topic_clean,
+    yield _sse({"event": "tool_end", "tool": "question_text"})
+    yield _sse({
+        "event": "question_ready",
+        "question": {
             "concept_id": concept_id,
             "concept_type": concept_type,
             "difficulty": difficulty,
-            **q_dict
-        }
+            "type": question_kind,
+            "question": statement,
+        },
+        "markdown": statement,
+    })
 
-        if mongo_db is not None:
-            try:
-                q_col = mongo_db.get_collection("questions")
-                await q_col.insert_one(q_doc)
-            except Exception:
-                pass
+    # 3. Tool 2 — metadata (+ code spec) and test cases
+    if is_code:
+        yield _sse({"event": "tool_start", "tool": "code_and_tests", "concept_id": concept_id})
 
-        safe_q = sanitize_question_for_client(q_doc)
-        yield f"data: {json.dumps({'event': 'complete', 'question': safe_q, 'markdown': safe_q.get('markdown', '')})}\n\n"
-    except Exception as err:
-        logger.error(f"[stream_question_generator] Error: {err}", exc_info=True)
+    meta: Optional[QuestionTextSchema] = None
+    try:
+        meta = await generate_question_meta(
+            topic_clean, concept_id, concept_type, difficulty, language, statement
+        )
+        # Keep the streamed statement authoritative.
+        meta.question = statement
+    except Exception as meta_err:
+        logger.warning("[stream_question_generator] Meta tool failed: %s", meta_err)
+        meta = QuestionTextSchema(
+            type="practice" if is_code else "mcq",
+            concept_id=concept_id,
+            difficulty=difficulty,
+            question=statement,
+            options=None if is_code else ["Option A", "Option B", "Option C", "Option D"],
+            correct_option=None if is_code else "Option A",
+            rubric=f"Evaluate correctness for {concept_id}." if is_code else None,
+        )
+
+    yield _sse({
+        "event": "meta",
+        "type": meta.type,
+        "function_signature": meta.function_signature,
+        "options": meta.options,
+        "rubric": meta.rubric,
+        "expected_time_complexity": meta.expected_time_complexity,
+        "expected_space_complexity": meta.expected_space_complexity,
+        "starter_code": meta.starter_code,
+    })
+
+    test_cases: List[Dict[str, Any]] = []
+    if is_code:
+        test_cases = await generate_test_cases(
+            topic_clean,
+            concept_id,
+            statement,
+            meta.function_signature,
+            language,
+        )
+        yield _sse({
+            "event": "test_cases",
+            "test_cases": test_cases,
+            "count": len(test_cases),
+            "generated": bool(test_cases),
+        })
+        yield _sse({"event": "tool_end", "tool": "code_and_tests"})
+
+    # 4. Assemble, persist, complete
+    doc = build_question_doc(
+        meta=meta,
+        statement=statement,
+        topic_clean=topic_clean,
+        concept_id=concept_id,
+        concept_type=concept_type,
+        difficulty=difficulty,
+        test_cases=test_cases,
+        language=language,
+    )
+
+    if q_collection is not None:
         try:
-            fallback_q = await get_or_generate_question(topic_clean, concept_id, concept_type, difficulty, mongo_db)
-            yield f"data: {json.dumps({'event': 'complete', 'question': fallback_q, 'markdown': fallback_q.get('markdown', '')})}\n\n"
-        except Exception:
-            yield f"data: {json.dumps({'event': 'error', 'message': str(err)})}\n\n"
+            await q_collection.insert_one(dict(doc))
+        except Exception as persist_err:
+            logger.warning("[stream_question_generator] Persist failed: %s", persist_err)
+
+    safe_q = sanitize_question_for_client(doc)
+    yield _sse({
+        "event": "complete",
+        "question": safe_q,
+        "markdown": safe_q.get("markdown", ""),
+        "execution_method": safe_q.get("execution_method"),
+        "has_test_cases": bool(safe_q.get("test_cases")),
+    })
 
 
 @router.post("/questions/generate")
@@ -230,16 +322,23 @@ async def submit_attempt(
     question_doc = await q_collection.find_one({"_id": payload.question_id})
 
     if not question_doc:
-        # Fallback question doc if ID is synthetic
+        question_doc = await q_collection.find_one({"id": payload.question_id})
+
+    if not question_doc:
+        # Synthetic fallback. Code questions are inferred from execution
+        # metrics so the all-test-cases gate still applies.
+        is_code_hint = bool(payload.total_test_cases) or payload.test_cases_passed is not None
         question_doc = {
             "_id": payload.question_id,
+            "id": payload.question_id,
             "topic": payload.topic,
             "concept_id": payload.concept_id,
-            "concept_type": "conceptual",
-            "type": "mcq",
+            "concept_type": "code" if is_code_hint else "conceptual",
+            "type": "practice" if is_code_hint else "mcq",
             "question": "Practice check",
-            "correct_option": "correct",
-            "execution_method": "llm_rubric"
+            "correct_option": None if is_code_hint else "correct",
+            "execution_method": "llm_rubric",
+            "test_cases": [],
         }
 
     # 1. Multi-Signal Evaluation
@@ -254,6 +353,38 @@ async def submit_attempt(
 
     breakdown = eval_result["evaluation_breakdown"]
     is_passed = bool(breakdown.get("correct", False) or score >= 0.7)
+
+    # Hard execution gate: a coding question is only passed when EVERY
+    # generated test case passes. The LLM rubric can never override this.
+    q_type = question_doc.get("type", "mcq")
+    q_concept_type = question_doc.get("concept_type", "conceptual")
+    is_code_question = q_type == "practice" or q_concept_type in ("code", "practice")
+    total_tests = payload.total_test_cases
+    if total_tests is None:
+        total_tests = len(question_doc.get("test_cases") or [])
+    passed_tests = payload.test_cases_passed or 0
+
+    if is_code_question:
+        if total_tests <= 0:
+            is_passed = False
+            score = min(score, 0.5)
+            breakdown["correct"] = False
+            breakdown["execution_gate"] = "No test cases available for this question; retry generation."
+            breakdown["feedback"] = (
+                "This coding question has no runnable test cases yet. "
+                "Regenerate the question or retry so test cases are produced."
+            )
+        elif passed_tests < total_tests:
+            is_passed = False
+            score = min(score, 0.5)
+            breakdown["correct"] = False
+            breakdown["execution_gate"] = (
+                f"{passed_tests}/{total_tests} test cases passed — all cases must pass."
+            )
+            breakdown["feedback"] = (
+                f"Your solution passed {passed_tests}/{total_tests} test cases. "
+                "Fix the failing cases and run the tests again before advancing."
+            )
 
     # 2. Insert Postgres attempt record
     attempt_record = Attempt(
@@ -381,8 +512,11 @@ async def submit_attempt(
     if lp_update and isinstance(lp_update, dict) and "nodes" in lp_update:
         lp_update = {k: v for k, v in lp_update.items() if k != "nodes"}
 
+    # The next question is streamed by the client after this response, which
+    # keeps submission latency low. Only embed it when explicitly cached: the
+    # client falls back to POST /questions/generate/stream otherwise.
     next_question = None
-    if is_passed and not is_concept_completed:
+    if payload.include_next_question and is_passed and not is_concept_completed:
         try:
             next_question = await get_or_generate_question(
                 topic=payload.topic,

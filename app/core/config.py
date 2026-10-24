@@ -85,6 +85,15 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440
 
     # ------------------------------------------------------------------
+    # Code execution sandbox (OneCompiler hosted runner)
+    # ------------------------------------------------------------------
+    CODE_EXECUTION_ENABLED: bool = True
+    # OneCompiler code-execution API. The key is read from ONE_COMPILER_API.
+    ONE_COMPILER_API: str = ""
+    ONE_COMPILER_API_URL: str = "https://api.onecompiler.com/api/code/exec"
+    ONE_COMPILER_TIMEOUT_SECONDS: float = 25.0
+
+    # ------------------------------------------------------------------
     # Application
     # ------------------------------------------------------------------
     ENV: str = "development"

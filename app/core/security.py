@@ -1,4 +1,8 @@
+import base64
+import hashlib
+
 import bcrypt
+from cryptography.fernet import Fernet, InvalidToken
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Any
 from jose import jwt, JWTError
@@ -41,3 +45,22 @@ def decode_access_token(token: str) -> Optional[dict]:
         return payload
     except JWTError:
         return None
+
+
+def _fernet() -> Fernet:
+    """Fernet instance keyed from JWT_SECRET (stable across restarts)."""
+    key = hashlib.sha256(settings.JWT_SECRET.encode("utf-8")).digest()
+    return Fernet(base64.urlsafe_b64encode(key))
+
+
+def encrypt_secret(plaintext: str) -> str:
+    """Encrypt a secret (e.g. a provider API key) for storage at rest."""
+    return _fernet().encrypt(plaintext.encode("utf-8")).decode("utf-8")
+
+
+def decrypt_secret(ciphertext: str) -> str:
+    """Decrypt a stored secret; raises ValueError if the token is invalid."""
+    try:
+        return _fernet().decrypt(ciphertext.encode("utf-8")).decode("utf-8")
+    except InvalidToken as exc:
+        raise ValueError("Stored secret could not be decrypted (JWT_SECRET changed?).") from exc

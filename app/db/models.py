@@ -63,6 +63,29 @@ class User(Base):
     concept_mastery = relationship("ConceptMastery", back_populates="user", cascade="all, delete-orphan")
     attempts = relationship("Attempt", back_populates="user", cascade="all, delete-orphan")
     user_topics = relationship("UserTopic", back_populates="user", cascade="all, delete-orphan")
+    llm_config = relationship("UserLLMConfig", back_populates="user", uselist=False, cascade="all, delete-orphan")
+
+class UserLLMConfig(Base):
+    """Per-user LLM provider credentials and generation settings.
+
+    The API key is stored encrypted at rest (Fernet key derived from JWT_SECRET).
+    When a row exists, it overrides the server-wide environment configuration for
+    every LLM call made on behalf of that user.
+    """
+    __tablename__ = "user_llm_config"
+
+    id = Column(UUIDType, primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUIDType, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, unique=True, index=True)
+    provider = Column(String, nullable=False, default="openai")
+    api_key_encrypted = Column(String, nullable=False)
+    model = Column(String, nullable=False)
+    base_url = Column(String, nullable=True)
+    temperature = Column(Float, nullable=False, default=0.7)
+    max_tokens = Column(Integer, nullable=False, default=4096)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+    user = relationship("User", back_populates="llm_config")
 
 class DiagnosticSession(Base):
     __tablename__ = "diagnostic_sessions"
@@ -201,7 +224,7 @@ class QuestionDocument(BaseModel):
     rubric: Optional[str] = None
     test_cases: Optional[List[TestCaseSchema]] = None
     expected_answer: Optional[str] = None
-    execution_method: str  # browser_pyodide, browser_js, piston_api, sympy, numeric_tolerance, llm_rubric
+    execution_method: str  # onecompiler, browser_pyodide, browser_js, sympy, numeric_tolerance, llm_rubric (legacy: piston_api)
 
     class Config:
         populate_by_name = True

@@ -4,8 +4,13 @@ import logging
 import asyncio
 from typing import Dict, Any, List, Optional
 from app.llm.gateway import call_llm_gateway
-from app.llm.prompts import QUESTION_GEN_PROMPT
-from app.llm.schemas import QuestionBatchSchema
+from app.llm.prompts import (
+    QUESTION_GEN_PROMPT,
+    QUESTION_META_PROMPT,
+    QUESTION_STATEMENT_PROMPT,
+    TEST_CASE_GEN_PROMPT,
+)
+from app.llm.schemas import QuestionBatchSchema, QuestionTextSchema, TestCaseListSchema
 
 import re
 
@@ -135,6 +140,296 @@ def sanitize_question_for_client(q: Dict[str, Any]) -> Dict[str, Any]:
     safe_q["markdown"] = build_question_markdown(safe_q)
     return safe_q
 
+def question_kind_for(concept_type: str) -> str:
+    """Map a concept type onto the question kind used by the fast pipeline."""
+    ct = (concept_type or "").lower()
+    if ct in ("code", "practice"):
+        return "practice"
+    if ct in ("math", "conceptual", "mcq"):
+        return "mcq"
+    return "mcq"
+
+
+def _is_code_question(concept_type: str, question_type: str) -> bool:
+    return question_type == "practice" or concept_type in ("code", "practice")
+
+
+async def generate_question_statement(
+    topic: str,
+    concept_id: str,
+    concept_type: str = "conceptual",
+    difficulty: int = 3,
+    language: str = "python",
+    explanation_language: str = "english",
+) -> str:
+    """Stream-friendly plain-text statement generation (no JSON)."""
+    kind = question_kind_for(concept_type)
+    chunks: List[str] = []
+    from app.llm.gateway import call_llm_gateway_stream
+
+    async for delta in call_llm_gateway_stream(
+        QUESTION_STATEMENT_PROMPT,
+        {
+            "topic": topic,
+            "concept_id": concept_id,
+            "concept_type": concept_type,
+            "difficulty": difficulty,
+            "question_type": kind,
+            "language": language,
+            "explanation_language": explanation_language,
+        }
+    ):
+        chunks.append(delta)
+    return "".join(chunks).strip()
+
+
+async def generate_question_meta(
+    topic: str,
+    concept_id: str,
+    concept_type: str = "conceptual",
+    difficulty: int = 3,
+    language: str = "python",
+    statement: Optional[str] = None,
+) -> QuestionTextSchema:
+    """Small structured call: type/options/signature/rubric only."""
+    kind = question_kind_for(concept_type)
+    if not statement:
+        statement = await generate_question_statement(
+            topic, concept_id, concept_type, difficulty, language
+        )
+    return await call_llm_gateway(
+        QUESTION_META_PROMPT,
+        {
+            "topic": topic,
+            "concept_id": concept_id,
+            "concept_type": concept_type,
+            "difficulty": difficulty,
+            "question_type": kind,
+            "language": language,
+            "statement": statement,
+        },
+        QuestionTextSchema,
+    )
+
+
+def _clean_test_cases(raw_cases: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    cleaned: List[Dict[str, Any]] = []
+    seen = set()
+    for tc in raw_cases or []:
+        if not isinstance(tc, dict):
+            continue
+        inp = str(tc.get("input", "")).strip()
+        out = str(tc.get("expected_output", "")).strip()
+        if not out:
+            continue
+        key = (inp, out)
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append({"input": inp, "expected_output": out})
+    return cleaned[:5]
+
+
+async def generate_test_cases(
+    topic: str,
+    concept_id: str,
+    statement: str,
+    function_signature: Optional[str],
+    language: str = "python",
+    max_attempts: int = 2,
+) -> List[Dict[str, Any]]:
+    """Generate validated test cases with retry; never raises."""
+    for attempt in range(1, max_attempts + 1):
+        try:
+            res = await call_llm_gateway(
+                TEST_CASE_GEN_PROMPT,
+                {
+                    "statement": statement,
+                    "function_signature": function_signature or "(infer from the statement)",
+                    "language": language,
+                },
+                TestCaseListSchema,
+            )
+            cases = _clean_test_cases([
+                tc.model_dump() if hasattr(tc, "model_dump") else dict(tc)
+                for tc in getattr(res, "test_cases", [])
+            ])
+            if cases:
+                logger.info(
+                    "[question_engine] Generated %d test cases for '%s' (attempt %d)",
+                    len(cases), concept_id, attempt,
+                )
+                return cases
+        except Exception as exc:
+            logger.warning(
+                "[question_engine] Test-case generation attempt %d failed for '%s': %s",
+                attempt, concept_id, exc,
+            )
+    logger.error("[question_engine] No test cases generated for '%s'.", concept_id)
+    return []
+
+
+def build_question_doc(
+    meta: QuestionTextSchema,
+    statement: str,
+    topic_clean: str,
+    concept_id: str,
+    concept_type: str,
+    difficulty: int,
+    test_cases: Optional[List[Dict[str, Any]]] = None,
+    language: str = "python",
+) -> Dict[str, Any]:
+    """Assemble a persisted/internal question document from pipeline parts."""
+    q_type = getattr(meta, "type", None) or question_kind_for(concept_type)
+    is_code = _is_code_question(concept_type, q_type)
+
+    options = list(getattr(meta, "options", None) or [])
+    correct = getattr(meta, "correct_option", None)
+    if options:
+        if correct is not None and correct not in options and str(correct).upper() in ["A", "B", "C", "D"]:
+            idx = ["A", "B", "C", "D"].index(str(correct).upper())
+            if idx < len(options):
+                correct = options[idx]
+        if correct not in options:
+            correct = options[0]
+        # Keep the correct option content stable while shuffling position.
+        correct_text = correct
+        random.shuffle(options)
+        correct = correct_text
+
+    q_id = f"q_{uuid.uuid4().hex[:10]}"
+    doc: Dict[str, Any] = {
+        "_id": q_id,
+        "id": q_id,
+        "topic": topic_clean,
+        "concept_id": concept_id,
+        "concept_type": concept_type,
+        "difficulty": int(getattr(meta, "difficulty", difficulty) or difficulty),
+        "type": q_type,
+        "question": statement or getattr(meta, "question", ""),
+        "options": options or None,
+        "correct_option": correct,
+        "rubric": getattr(meta, "rubric", None),
+        "expected_time_complexity": getattr(meta, "expected_time_complexity", None),
+        "expected_space_complexity": getattr(meta, "expected_space_complexity", None),
+        "function_signature": getattr(meta, "function_signature", None),
+        "starter_code": getattr(meta, "starter_code", None),
+        "expected_answer": getattr(meta, "expected_answer", None),
+        "explanation": getattr(meta, "explanation", None),
+        "test_cases": test_cases or None,
+        "language": language,
+        "execution_method": "onecompiler" if is_code else "exact_match",
+        "created_at": __import__("datetime").datetime.utcnow().isoformat(),
+    }
+    return normalize_mcq_question_fields(doc)
+
+
+async def _find_cached_question(
+    concept_id: str,
+    topic_clean: str,
+    difficulty: int,
+    concept_type: str,
+    q_collection: Any,
+) -> Optional[Dict[str, Any]]:
+    if q_collection is None:
+        return None
+    try:
+        docs = await asyncio.wait_for(
+            q_collection.find({"concept_id": concept_id, "topic": topic_clean}).to_list(12),
+            timeout=2.0,
+        )
+    except Exception as exc:
+        logger.warning("[question_engine] Cache read failed: %s", exc)
+        return None
+
+    docs = [
+        d for d in docs
+        if not str(d.get("_id", "")).startswith("q_fallback_")
+        and not str(d.get("id", "")).startswith("q_fallback_")
+    ]
+    if not docs:
+        return None
+
+    is_code = concept_type in ("code", "practice")
+    if is_code:
+        with_tests = [d for d in docs if d.get("test_cases")]
+        # Cached code questions without tests are useless for execution.
+        docs = with_tests
+    if not docs:
+        return None
+
+    exact = [d for d in docs if d.get("difficulty") == difficulty]
+    return random.choice(exact or docs)
+
+
+async def generate_single_question(
+    topic: str,
+    concept_id: str,
+    concept_type: str = "conceptual",
+    difficulty: int = 3,
+    language: str = "python",
+    explanation_language: str = "english",
+    statement: Optional[str] = None,
+    mongo_db: Any = None,
+) -> Dict[str, Any]:
+    """Generate ONE question via the split pipeline and persist it."""
+    topic_clean = (topic or "").strip().lower()
+    language = (language or "python").lower()
+    is_code = concept_type in ("code", "practice")
+
+    if not statement:
+        statement = await generate_question_statement(
+            topic_clean, concept_id, concept_type, difficulty, language, explanation_language
+        )
+
+    # Metadata is required; fall back to a minimal deterministic meta on failure.
+    try:
+        meta = await generate_question_meta(
+            topic_clean, concept_id, concept_type, difficulty, language, statement
+        )
+    except Exception as exc:
+        logger.warning("[question_engine] Meta generation failed for '%s': %s", concept_id, exc)
+        meta = QuestionTextSchema(
+            type="practice" if is_code else "mcq",
+            concept_id=concept_id,
+            difficulty=difficulty,
+            question=statement or f"Practice {concept_id}",
+            options=None if is_code else ["Option A", "Option B", "Option C", "Option D"],
+            correct_option=None if is_code else "Option A",
+            rubric=f"Evaluate correctness for {concept_id}." if is_code else None,
+        )
+
+    test_cases: List[Dict[str, Any]] = []
+    if is_code:
+        test_cases = await generate_test_cases(
+            topic_clean,
+            concept_id,
+            statement or meta.question,
+            getattr(meta, "function_signature", None),
+            language,
+        )
+
+    doc = build_question_doc(
+        meta=meta,
+        statement=statement or meta.question,
+        topic_clean=topic_clean,
+        concept_id=concept_id,
+        concept_type=concept_type,
+        difficulty=difficulty,
+        test_cases=test_cases,
+        language=language,
+    )
+
+    q_collection = mongo_db.get_collection("questions") if mongo_db is not None else None
+    if q_collection is not None:
+        try:
+            await asyncio.wait_for(q_collection.insert_one(dict(doc)), timeout=4.0)
+        except Exception as exc:
+            logger.warning("[question_engine] Could not persist question: %s", exc)
+
+    return doc
+
+
 async def get_or_generate_question(
     topic: str,
     concept_id: str,
@@ -145,21 +440,28 @@ async def get_or_generate_question(
     mongo_db: Any = None,
     include_internal: bool = False
 ) -> Dict[str, Any]:
-    """Retrieves a single question for topic & concept_id from MongoDB or triggers mini-batch LLM generation."""
-    batch = await get_or_generate_question_batch(
-        topic=topic,
-        concept_id=concept_id,
-        concept_type=concept_type,
-        difficulty=difficulty,
-        count=3,
-        language=language,
-        explanation_language=explanation_language,
-        mongo_db=mongo_db,
-        include_internal=include_internal
+    """Retrieve a cached question or generate exactly one (fast path)."""
+    topic_clean = (topic or "").strip().lower()
+    q_collection = mongo_db.get_collection("questions") if mongo_db is not None else None
+
+    cached = await _find_cached_question(
+        concept_id, topic_clean, difficulty, concept_type, q_collection
     )
-    if batch:
-        return random.choice(batch)
-    raise RuntimeError(f"No questions could be generated for concept '{concept_id}'.")
+    if cached:
+        doc = dict(cached)
+    else:
+        doc = await generate_single_question(
+            topic=topic_clean,
+            concept_id=concept_id,
+            concept_type=concept_type,
+            difficulty=difficulty,
+            language=language,
+            explanation_language=explanation_language,
+            mongo_db=mongo_db,
+        )
+
+    doc = normalize_mcq_question_fields(doc)
+    return doc if include_internal else sanitize_question_for_client(doc)
 
 async def _generate_and_save_batch(
     topic_clean: str,
@@ -211,7 +513,7 @@ async def _generate_and_save_batch(
         q_type = getattr(q_item, "type", "mcq") or "mcq"
         
         if eff_concept_type == "code" and q_type == "practice":
-            method = "piston_api"
+            method = "onecompiler"
         elif eff_concept_type == "math":
             method = "sympy" if q_type == "practice" else "numeric_tolerance"
         elif q_type in ["mcq", "true_false"]:

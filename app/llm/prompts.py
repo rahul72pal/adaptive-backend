@@ -542,3 +542,103 @@ Explicitly target the demonstrated student misconceptions without simply repeati
 Return structured JSON following format instructions:
 {format_instructions}"""
 )
+
+
+# ---------------------------------------------------------------------------
+# 7. FAST QUESTION PIPELINE — statement → meta/code → test cases
+# ---------------------------------------------------------------------------
+# The pipeline is split so the UI can stream the problem statement immediately
+# while the smaller metadata call and the test-case tool run afterwards.
+
+QUESTION_STATEMENT_PROMPT = ChatPromptTemplate.from_template(
+    """You write a single assessment question for an adaptive learning platform.
+
+Topic: {topic}
+Concept: {concept_id}
+Concept type: {concept_type}   # code | math | conceptual | other
+Target difficulty: {difficulty} (1=easiest, 5=hardest)
+Question kind: {question_type}
+Programming language: {language}
+Explanation language: {explanation_language}
+
+Write ONLY the problem statement in clean GitHub-flavoured Markdown.
+Rules:
+- For a coding practice question: describe the task, input/output contract, and
+  1-2 examples. Do NOT include the function signature, starter code, or test cases.
+- For a multiple-choice question: write ONLY the question stem. Do NOT write the
+  answer choices.
+- Keep it concise: at most 12 lines. Use `inline code` for identifiers.
+- No preamble, no headings like "Question:", no JSON, no code fences around the whole answer.
+
+Return the statement text only."""
+)
+
+QUESTION_META_PROMPT = ChatPromptTemplate.from_template(
+    """You convert a question statement into structured metadata.
+Topic: {topic}
+Concept: {concept_id}
+Concept type: {concept_type}
+Difficulty: {difficulty}
+Question kind: {question_type}
+Programming language: {language}
+Statement:
+{statement}
+
+Produce JSON with these fields:
+- type: "practice" for coding tasks, otherwise "mcq" | "true_false" | "short_answer" | "open_ended"
+- concept_id: "{concept_id}"
+- difficulty: {difficulty}
+- question: the statement verbatim (Markdown)
+- options: EXACTLY 4 full-text choices when type is mcq/true_false, else null
+- correct_option: exact text of the correct option (must match one of options) for mcq, else null
+- rubric: grading rubric for practice/open_ended, else null
+- expected_time_complexity / expected_space_complexity: e.g. "O(n)" for coding tasks, else null
+- function_signature: the function name and parameters the tests will call, in {language}
+  (e.g. "def two_sum(nums: list[int], target: int) -> list[int]:"), else null
+- starter_code: for practice tasks ONLY, complete self-contained starter code in
+  {language} that already includes everything the learner needs, else null.
+  * Put the function name on the LAST line of the file so the runner can find it.
+  * Include all required imports (e.g. `from typing import List, Optional`).
+  * If the task involves a linked list or binary tree, DEFINE the node class(es)
+    in the starter code exactly as:
+      class ListNode:
+          def __init__(self, val=0, next=None):
+              self.val = val
+              self.next = next
+      class TreeNode:
+          def __init__(self, val=0, left=None, right=None):
+              self.val = val
+              self.left = left
+              self.right = right
+    Test inputs for those types are JSON level-order/value arrays; do not ask the
+    learner to parse them.
+  * End the function body with a placeholder (`pass`, `return None`, or a TODO).
+  * Do NOT include test cases or driver code.
+- expected_answer: short reference answer for short_answer, else null
+- explanation: one-sentence explanation of the correct choice, else null
+
+{format_instructions}"""
+)
+
+TEST_CASE_GEN_PROMPT = ChatPromptTemplate.from_template(
+    """Generate test cases for a coding problem.
+
+Problem statement:
+{statement}
+
+Function signature ({language}):
+{function_signature}
+
+Rules:
+- Return 3 to 5 test cases.
+- `input` MUST be raw JSON data only, never a variable assignment.
+  * Invalid: "nums = [2, 7, 11, 15], target = 9".
+  * For a single array argument use "[2, 7, 11, 15]".
+  * For multiple arguments use a JSON array of arguments: "[[2,7,11,15], 9]".
+- `expected_output` MUST be the exact JSON value the function returns
+  (e.g. "[0, 1]", "true", "42", "\"abc\"").
+- Include at least one edge case (empty input, duplicates, negatives, or a single element).
+- Double-check each expected output by mentally executing a correct solution.
+
+{format_instructions}"""
+)

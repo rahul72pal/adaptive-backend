@@ -90,7 +90,7 @@ async def evaluate_user_attempt(
                 execution_feedback = f"Could not parse math expression symbolically: {e}"
 
     # 4. Code Execution (Use client browser runtime metrics if provided, else fallback to sandbox)
-    elif concept_type == "code" or q_type == "practice" or execution_method in ["piston_api", "browser_compiler"]:
+    elif concept_type == "code" or q_type == "practice" or execution_method in ["onecompiler", "piston_api", "browser_compiler"]:
         if test_cases_passed is not None and total_test_cases is not None and total_test_cases > 0:
             tc_total = total_test_cases
             tc_passed = min(test_cases_passed, tc_total)
@@ -99,18 +99,19 @@ async def evaluate_user_attempt(
         else:
             test_cases = question_doc.get("test_cases") or []
             tc_total = len(test_cases)
+            # A coding submission cannot earn execution credit by keyword
+            # matching. Without real run results every case is treated as failed
+            # so the user must actually run the tests.
+            tc_passed = 0
+            execution_score = 0.0
             if tc_total > 0:
-                passed = 0
-                for tc in test_cases:
-                    expected_out = str(tc.get("expected_output", "")).strip()
-                    if expected_out in user_answer or "return" in user_answer or "def " in user_answer or "const " in user_answer:
-                        passed += 1
-                tc_passed = passed
-                execution_score = round(passed / tc_total, 4)
-                execution_feedback = f"Passed {passed}/{tc_total} test cases."
+                execution_feedback = (
+                    f"0/{tc_total} test cases verified. Run the test cases before submitting."
+                )
             else:
-                execution_score = 1.0 if len(user_answer) > 15 else 0.4
-                execution_feedback = "No explicit test cases provided; basic code structure verified."
+                execution_feedback = (
+                    "No runnable test cases were generated; execution cannot be verified."
+                )
 
 
     # 5. LLM Secondary Rubric Evaluation
