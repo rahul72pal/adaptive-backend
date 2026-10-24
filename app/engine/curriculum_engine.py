@@ -25,14 +25,32 @@ def slugify_topic(topic: str) -> str:
     return s.strip('-')
 
 def normalize_topic(topic: str) -> Dict[str, str]:
-    """Normalizes user input string into user_topic, canonical_topic, and slug."""
-    user_topic = topic.strip()
-    slug = slugify_topic(user_topic)
-    canonical_topic = user_topic.replace("-", " ").replace("_", " ").title()
+    """Normalizes user input string into user_topic, canonical_topic, slug, and stable topic_id."""
+    clean_topic = topic.strip()
+    try:
+        from app.services.topic_catalog_service import get_catalog_service
+        catalog = get_catalog_service()
+        res = catalog.resolve_topic(clean_topic)
+        if res.is_resolved and res.topic:
+            t = res.topic
+            return {
+                "user_topic": clean_topic,
+                "canonical_topic": t.name,
+                "slug": slugify_topic(t.name),
+                "topic_id": t.topic_id,
+                "category_id": t.category_id,
+            }
+    except Exception:
+        pass
+
+    slug = slugify_topic(clean_topic)
+    canonical_topic = clean_topic.replace("-", " ").replace("_", " ").title()
     return {
-        "user_topic": user_topic,
+        "user_topic": clean_topic,
         "canonical_topic": canonical_topic,
-        "slug": slug
+        "slug": slug,
+        "topic_id": f"custom_{slug.replace('-', '_')}",
+        "category_id": "cat_custom",
     }
 
 
@@ -443,29 +461,43 @@ async def get_or_create_level_graph(
     previous_concept_ids: Optional[List[str]] = None
 ) -> Dict[str, Any]:
     """Retrieves level-specific canonical concept graph from MongoDB or generates a new one dynamically via LLM."""
+    from app.catalog.context import TopicGenerationContext
+    context = TopicGenerationContext.from_topic_identifier(topic, target_level=level)
     norm = normalize_topic(topic)
     level_clean = level.strip().lower()
-    doc_id = f"{norm['slug']}_{level_clean}"
+    doc_id = f"{context.topic_id}_{level_clean}"
+    target_nodes = context.target_node_count
+    learning_count = max(2, round(target_nodes * 0.7))
+    practice_count = max(1, target_nodes - learning_count) if context.allow_practice_nodes else 0
+    min_acceptable_nodes = min(target_nodes - 2, 3)
     
     collection = mongo_db.get_collection("concept_graphs") if mongo_db is not None else None
     
     if collection is not None:
+        # Check by stable topic_id_level first, then by legacy slug_level
         existing = await collection.find_one({"_id": doc_id})
+        if not existing:
+            legacy_doc_id = f"{norm['slug']}_{level_clean}"
+            existing = await collection.find_one({"_id": legacy_doc_id})
+
         if existing:
             nodes = existing.get("nodes") or existing.get("concepts") or []
-            if len(nodes) >= 6:
+            if len(nodes) >= min_acceptable_nodes:
                 return existing
-            logger.info(f"[get_or_create_level_graph] Cached graph '{doc_id}' has only {len(nodes)} nodes (< 6). Invalidating cache to generate full 8-node graph...")
+            logger.info(
+                f"[get_or_create_level_graph] Cached graph has only {len(nodes)} nodes "
+                f"(< {min_acceptable_nodes}). Regenerating graph with target={target_nodes}..."
+            )
 
         # Fuzzy search fallback for existing level graph
         all_graphs = await collection.find({"level": level_clean}).to_list(100)
         for g in all_graphs:
-            aliases = g.get("aliases", []) + [g.get("topic", ""), g.get("canonical_topic", "")]
-            match = process.extractOne(norm["canonical_topic"], aliases, scorer=fuzz.token_sort_ratio)
+            aliases = g.get("aliases", []) + [g.get("topic", ""), g.get("canonical_topic", ""), g.get("topic_id", "")]
+            match = process.extractOne(context.canonical_topic, aliases, scorer=fuzz.token_sort_ratio)
             if match and match[1] >= 85:
                 nodes = g.get("nodes") or g.get("concepts") or []
-                if len(nodes) >= 6:
-                    logger.info(f"Fuzzy matched level graph '{norm['canonical_topic']}' to '{g['_id']}'")
+                if len(nodes) >= min_acceptable_nodes:
+                    logger.info(f"Fuzzy matched level graph '{context.canonical_topic}' to '{g['_id']}'")
                     return g
 
     # Build clean excluded concept IDs set
@@ -479,7 +511,9 @@ async def get_or_create_level_graph(
 
     # Also automatically include concept IDs from MongoDB concept_graphs for preceding levels
     if mongo_db is not None and level_clean in LEVEL_ORDER and level_clean != "beginner":
-        auto_prev_ids = await get_previous_concept_ids(norm["slug"], level_clean, mongo_db)
+        auto_prev_ids = await get_previous_concept_ids(context.topic_id, level_clean, mongo_db)
+        if not auto_prev_ids:
+            auto_prev_ids = await get_previous_concept_ids(norm["slug"], level_clean, mongo_db)
         excluded_ids_set.update(auto_prev_ids)
 
     # Generate canonical level graph dynamically via LLM (up to 2 attempts on empty/invalid result)
@@ -491,8 +525,14 @@ async def get_or_create_level_graph(
             res = await call_llm_gateway(
                 CURRICULUM_GRAPH_PROMPT,
                 {
-                    "topic": norm["canonical_topic"],
+                    "topic": context.canonical_topic,
+                    "topic_kind": context.kind,
+                    "topic_scope": context.scope,
                     "target_level": level_clean,
+                    "target_node_count": target_nodes,
+                    "learning_count": learning_count,
+                    "practice_count": practice_count,
+                    "assessment_mode": context.assessment_mode,
                     "previous_level_concepts": prev_concepts_str
                 },
                 ConceptGraphSchema
@@ -522,11 +562,20 @@ async def get_or_create_level_graph(
                 c_dict["id"] = cid
                 c_dict["concept_id"] = cid
                 c_dict["node_type"] = c_dict.get("node_type") if c_dict.get("node_type") in ["learning", "practice"] else "learning"
-                c_dict["pattern"] = c_dict.get("pattern") or "none"
-                valid_types = ["code", "conceptual", "mcq", "short_answer", "math"]
+                c_dict["pattern"] = c_dict.get("pattern") or (context.pattern_tags[0] if context.pattern_tags else "none")
+
+                # Adapt concept_type to assessment mode
+                if context.assessment_mode == "conceptual_only":
+                    valid_types = ["conceptual", "mcq", "short_answer", "math"]
+                else:
+                    valid_types = ["code", "conceptual", "mcq", "short_answer", "math"]
+
                 c_type = c_dict.get("concept_type")
                 if c_type not in valid_types:
-                    c_type = "conceptual" if c_dict["node_type"] == "learning" else random.choice(["code", "mcq", "conceptual", "short_answer"])
+                    c_type = "conceptual" if c_dict["node_type"] == "learning" else (
+                        random.choice(["conceptual", "mcq", "short_answer"]) if context.assessment_mode == "conceptual_only"
+                        else random.choice(["code", "mcq", "conceptual", "short_answer"])
+                    )
                 c_dict["concept_type"] = c_type
                 concepts_data.append(c_dict)
 
@@ -541,9 +590,15 @@ async def get_or_create_level_graph(
 
             doc = {
                 "_id": doc_id,
+                "topic_id": context.topic_id,
                 "topic": norm["slug"],
-                "canonical_topic": norm["canonical_topic"],
+                "canonical_topic": context.canonical_topic,
+                "category_id": context.category_id,
+                "category_name": context.category_name,
                 "level": level_clean,
+                "kind": context.kind,
+                "assessment_mode": context.assessment_mode,
+                "metadata_version": context.metadata_version,
                 "aliases": res.aliases or [],
                 "concepts": concepts_data,
                 "nodes": concepts_data
@@ -559,7 +614,7 @@ async def get_or_create_level_graph(
             logger.warning(f"[get_or_create_level_graph] Attempt {attempt} failed: {gen_err}. {'Retrying...' if attempt < 2 else 'Giving up.'}")
 
     raise RuntimeError(
-        f"Failed to generate concept graph for topic='{norm['canonical_topic']}' level='{level_clean}' after 2 attempts. Last error: {last_gen_error}"
+        f"Failed to generate concept graph for topic='{context.canonical_topic}' level='{level_clean}' after 2 attempts. Last error: {last_gen_error}"
     )
 
 
@@ -634,22 +689,20 @@ async def get_diagnostic_checklist(
     user_id: Optional[Any] = None
 ) -> List[Dict[str, Any]]:
     """
-    Returns exactly 15 diagnostic concept entries [{concept_id, level}, ...] for a topic.
+    Returns diagnostic concept entries [{concept_id, level}, ...] for a topic,
+    tuned to the topic's metadata and target probe count.
 
     Priority order (fastest to slowest):
     1. User's existing learning_path nodes in MongoDB  → 0 LLM calls, <5ms
     2. Cached diagnostic_checklists collection         → 0 LLM calls, <10ms
     3. Single lightweight LLM call                    → 1 LLM call, ~5-15s
-
-    The diagnostic engine only needs concept_id + level — it does NOT need the
-    full ConceptGraphSchema (dependencies, patterns, complexity, node_types).
-    Keeping this separate from concept_graphs avoids triggering the expensive
-    4-level full-graph generation during diagnostic startup.
     """
+    from app.catalog.context import TopicGenerationContext
+    context = TopicGenerationContext.from_topic_identifier(topic)
     norm = normalize_topic(topic)
-    MAX_CONCEPTS = 15
-    LEVELS_ORDER = ["beginner", "intermediate", "advanced", "expert"]
-    PER_LEVEL_LIMIT = 4
+    max_concepts = context.max_diagnostic_questions
+    levels_order = ["beginner", "intermediate", "advanced", "expert"]
+    per_level_limit = max(2, (max_concepts + len(levels_order) - 1) // len(levels_order))
 
     # ----------------------------------------------------------------
     # TIER 1: User already has a learning path for this topic
@@ -660,11 +713,16 @@ async def get_diagnostic_checklist(
             lp_collection = mongo_db.get_collection("learning_paths")
             lp_doc = await lp_collection.find_one({
                 "user_id": str(user_id),
-                "topic": {"$in": [norm["slug"], norm["canonical_topic"], topic.strip().lower()]}
+                "$or": [
+                    {"topic": norm["slug"]},
+                    {"topic": norm["canonical_topic"]},
+                    {"topic": context.topic_id},
+                    {"canonical_topic": context.canonical_topic}
+                ]
             })
             if lp_doc:
                 lp_nodes = lp_doc.get("nodes", [])
-                by_level: Dict[str, List] = {lvl: [] for lvl in LEVELS_ORDER}
+                by_level: Dict[str, List] = {lvl: [] for lvl in levels_order}
                 for node in lp_nodes:
                     if node.get("node_type", "learning") != "learning":
                         continue
@@ -674,16 +732,16 @@ async def get_diagnostic_checklist(
                         by_level[lvl].append({"concept_id": cid, "level": lvl})
 
                 checklist: List[Dict] = []
-                for lvl in LEVELS_ORDER:
-                    checklist.extend(by_level[lvl][:PER_LEVEL_LIMIT])
-                    if len(checklist) >= MAX_CONCEPTS:
+                for lvl in levels_order:
+                    checklist.extend(by_level[lvl][:per_level_limit])
+                    if len(checklist) >= max_concepts:
                         break
-                checklist = checklist[:MAX_CONCEPTS]
+                checklist = checklist[:max_concepts]
 
                 if checklist:
                     logger.info(
                         f"[get_diagnostic_checklist] TIER-1 HIT: {len(checklist)} concepts "
-                        f"from existing learning_path for topic='{norm['slug']}'"
+                        f"from existing learning_path for topic='{context.topic_id}'"
                     )
                     return checklist
         except Exception as e:
@@ -692,14 +750,14 @@ async def get_diagnostic_checklist(
     # ----------------------------------------------------------------
     # TIER 2: Cached diagnostic_checklists collection in MongoDB
     # ----------------------------------------------------------------
-    cache_id = f"diag_checklist:{norm['slug']}"
+    cache_id = f"diag_checklist:{context.topic_id}:{context.metadata_version}"
     if mongo_db is not None:
         try:
             cl_collection = mongo_db.get_collection("diagnostic_checklists")
             cached = await cl_collection.find_one({"_id": cache_id})
             if cached and cached.get("concepts"):
                 logger.info(
-                    f"[get_diagnostic_checklist] TIER-2 HIT: cached checklist for topic='{norm['slug']}'"
+                    f"[get_diagnostic_checklist] TIER-2 HIT: cached checklist for topic='{context.topic_id}'"
                 )
                 return cached["concepts"]
         except Exception as e:
@@ -707,18 +765,22 @@ async def get_diagnostic_checklist(
 
     # ----------------------------------------------------------------
     # TIER 3: Single lightweight LLM call — returns only concept_ids
-    # (no dependencies, no patterns, no full graph — just names + levels)
     # ----------------------------------------------------------------
-    logger.info(f"[get_diagnostic_checklist] TIER-3: LLM call for topic='{norm['canonical_topic']}'")
+    logger.info(f"[get_diagnostic_checklist] TIER-3: LLM call for topic='{context.canonical_topic}' (target={max_concepts})")
     try:
         res = await call_llm_gateway(
             DIAGNOSTIC_CHECKLIST_PROMPT,
-            {"topic": norm["canonical_topic"]},
+            {
+                "topic": context.canonical_topic,
+                "topic_kind": context.kind,
+                "assessment_mode": context.assessment_mode,
+                "max_probes": max_concepts,
+            },
             DiagnosticChecklistSchema
         )
 
-        # Distribute proportionally across levels, cap at MAX_CONCEPTS
-        by_level = {lvl: [] for lvl in LEVELS_ORDER}
+        # Distribute proportionally across levels, cap at max_concepts
+        by_level = {lvl: [] for lvl in levels_order}
         for item in res.concepts or []:
             cid = getattr(item, "concept_id", None)
             lvl = getattr(item, "level", "beginner")
@@ -726,11 +788,11 @@ async def get_diagnostic_checklist(
                 by_level[lvl].append({"concept_id": cid.strip().lower(), "level": lvl})
 
         checklist = []
-        for lvl in LEVELS_ORDER:
-            checklist.extend(by_level[lvl][:PER_LEVEL_LIMIT])
-            if len(checklist) >= MAX_CONCEPTS:
+        for lvl in levels_order:
+            checklist.extend(by_level[lvl][:per_level_limit])
+            if len(checklist) >= max_concepts:
                 break
-        checklist = checklist[:MAX_CONCEPTS]
+        checklist = checklist[:max_concepts]
 
         if not checklist:
             raise ValueError("LLM returned empty concept checklist")
@@ -741,10 +803,19 @@ async def get_diagnostic_checklist(
                 cl_collection = mongo_db.get_collection("diagnostic_checklists")
                 await cl_collection.update_one(
                     {"_id": cache_id},
-                    {"$set": {"_id": cache_id, "topic": norm["slug"], "concepts": checklist}},
+                    {
+                        "$set": {
+                            "_id": cache_id,
+                            "topic_id": context.topic_id,
+                            "topic": norm["slug"],
+                            "canonical_topic": context.canonical_topic,
+                            "concepts": checklist,
+                            "metadata_version": context.metadata_version
+                        }
+                    },
                     upsert=True
                 )
-                logger.info(f"[get_diagnostic_checklist] Cached checklist for '{norm['slug']}'")
+                logger.info(f"[get_diagnostic_checklist] Cached checklist for '{context.topic_id}'")
             except Exception as save_err:
                 logger.warning(f"[get_diagnostic_checklist] Failed to cache checklist: {save_err}")
 
@@ -755,12 +826,11 @@ async def get_diagnostic_checklist(
         slug = norm["slug"]
         return [
             {"concept_id": f"{slug}_fundamentals", "level": "beginner"},
-            {"concept_id": f"{slug}_data_structures", "level": "beginner"},
             {"concept_id": f"{slug}_core_mechanics", "level": "beginner"},
             {"concept_id": f"{slug}_common_patterns", "level": "intermediate"},
             {"concept_id": f"{slug}_implementation_techniques", "level": "intermediate"},
             {"concept_id": f"{slug}_advanced_optimization", "level": "advanced"},
-            {"concept_id": f"{slug}_system_design", "level": "expert"},
+            {"concept_id": f"{slug}_tradeoffs_and_variants", "level": "expert"},
         ]
 
 
@@ -1083,10 +1153,15 @@ async def sync_learning_path_progress(
         lp_doc = await lp_collection.find_one({"_id": learning_path_id, "user_id": user_id_str})
 
     if not lp_doc:
-        lp_doc = await lp_collection.find_one({"user_id": user_id_str, "topic": topic_slug})
-
-    if not lp_doc:
-        lp_doc = await lp_collection.find_one({"user_id": user_id_str, "topic": topic_slug.lower()})
+        norm = normalize_topic(topic_slug)
+        candidate_topics = list({topic_slug, topic_slug.lower(), norm["slug"], norm.get("topic_id", "")} - {""})
+        lp_doc = await lp_collection.find_one({
+            "user_id": user_id_str,
+            "$or": [
+                {"topic": {"$in": candidate_topics}},
+                {"topic_id": {"$in": candidate_topics}}
+            ]
+        })
 
     if not lp_doc:
         return None
@@ -1278,16 +1353,22 @@ async def generate_learning_content(
     force_regenerate: bool = False
 ) -> Dict[str, Any]:
     """Generates structured learning lesson content with Redis & MongoDB caching for instant response times."""
+    from app.catalog.context import TopicGenerationContext
+    context = TopicGenerationContext.from_topic_identifier(
+        topic,
+        target_level=level,
+        selected_language=language
+    )
     norm = normalize_topic(topic)
-    pattern_clean = pattern or "none"
+    pattern_clean = pattern or (context.pattern_tags[0] if context.pattern_tags else "none")
     
-    # Validate and sanitize language parameter to prevent payload bugs (e.g. topic passed as language)
+    # Validate and sanitize language parameter
     valid_langs = {"python", "javascript", "js", "typescript", "cpp", "c++", "java", "go", "rust", "csharp", "c#"}
-    lang_input = (language or "python").lower().strip()
+    lang_input = (context.selected_language or language or "python").lower().strip()
     lang_clean = lang_input if lang_input in valid_langs else "python"
     exp_lang_clean = (explanation_language or "english").lower().strip()
     
-    cache_key = f"lesson_v4:{norm['slug']}:{concept_id}:{level}:{pattern_clean}:{lang_clean}:{exp_lang_clean}"
+    cache_key = f"lesson_v5:{context.topic_id}:{concept_id}:{level}:{pattern_clean}:{lang_clean}:{exp_lang_clean}:{context.metadata_version}"
 
     # 1. Check Redis Cache (< 5ms response time) unless force_regenerate is True
     from app.db.redis_client import get_redis_client
@@ -1336,7 +1417,9 @@ async def generate_learning_content(
     res = await call_llm_gateway(
         LEARNING_CONTENT_PROMPT,
         {
-            "topic": norm["canonical_topic"],
+            "topic": context.canonical_topic,
+            "topic_kind": context.kind,
+            "assessment_mode": context.assessment_mode,
             "concept_id": concept_id,
             "level": level,
             "pattern": pattern_clean,

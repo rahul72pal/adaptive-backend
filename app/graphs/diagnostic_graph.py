@@ -54,8 +54,9 @@ async def ask_node(state: DiagnosticState) -> Dict[str, Any]:
     
     current_turn = state.get("turns_used", 0) + 1
     raw_topic = state.get("topic", "")
-    topic_slug = raw_topic.strip().lower().replace(" ", "_")
-    cache_key = f"diag_q:{topic_slug}:{target_concept}"
+    from app.catalog.context import TopicGenerationContext
+    context = TopicGenerationContext.from_topic_identifier(raw_topic)
+    cache_key = f"diag_q:{context.topic_id}:{target_concept}:{context.metadata_version}"
 
     question_str = None
 
@@ -95,7 +96,10 @@ async def ask_node(state: DiagnosticState) -> Dict[str, Any]:
                 DIAGNOSTIC_ASK_PROMPT,
                 {
                     "concept": target_concept,
-                    "topic": raw_topic,
+                    "topic": context.canonical_topic,
+                    "topic_kind": context.kind,
+                    "assessment_mode": context.assessment_mode,
+                    "selected_language": context.selected_language or "python",
                     "history": current_turn
                 },
                 DiagnosticQuestionSchema
@@ -104,10 +108,15 @@ async def ask_node(state: DiagnosticState) -> Dict[str, Any]:
         except Exception as llm_err:
             logger.error(f"[ask_node] Failed to generate diagnostic question via LLM gateway: {llm_err}")
             concept_readable = target_concept.replace("_", " ").title()
-            question_str = (
-                f"How would you approach solving or implementing **{concept_readable}** in `{raw_topic}`? "
-                f"Walk through the core algorithmic mechanism, data structure choices, and time/space complexity."
-            )
+            if context.assessment_mode == "conceptual_only":
+                question_str = (
+                    f"Explain the core principle, invariant, and mathematical reasoning for **{concept_readable}** in `{context.canonical_topic}`."
+                )
+            else:
+                question_str = (
+                    f"How would you approach solving or implementing **{concept_readable}** in `{context.canonical_topic}`? "
+                    f"Walk through the core algorithmic mechanism, data structure choices, and time/space complexity."
+                )
 
         # Save to Redis & MongoDB cache for future diagnostic turns/sessions
         if redis_c and question_str:
@@ -122,7 +131,16 @@ async def ask_node(state: DiagnosticState) -> Dict[str, Any]:
                 col = mongo_db.get_collection("diagnostic_questions")
                 await col.update_one(
                     {"_id": cache_key},
-                    {"$set": {"_id": cache_key, "topic": topic_slug, "concept": target_concept, "question": question_str}},
+                    {
+                        "$set": {
+                            "_id": cache_key,
+                            "topic_id": context.topic_id,
+                            "topic": context.canonical_topic,
+                            "concept": target_concept,
+                            "question": question_str,
+                            "metadata_version": context.metadata_version
+                        }
+                    },
                     upsert=True
                 )
             except Exception as save_mg_err:
@@ -152,12 +170,18 @@ async def score_node(state: DiagnosticState) -> Dict[str, Any]:
     current_concept = state.get("current_concept") or "fundamentals"
     user_answer = state.get("last_user_answer") or ""
     current_question = state.get("current_question", "")
+    raw_topic = state.get("topic", "")
+
+    from app.catalog.context import TopicGenerationContext
+    context = TopicGenerationContext.from_topic_identifier(raw_topic)
 
     # Execute multi-agent pipeline: EvaluatorAgent -> FeedbackAgent -> Aggregator
     result = await DiagnosticOrchestrator.process_turn(
         concept=current_concept,
         question=current_question,
-        answer=user_answer
+        answer=user_answer,
+        topic_kind=context.kind,
+        assessment_mode=context.assessment_mode
     )
 
     confidence = result.get("confidence", 0.0)
@@ -204,8 +228,9 @@ def route_diagnostic(state: DiagnosticState) -> str:
     turns_used = state.get("turns_used", 0)
 
     unprobed = [c for c in checklist if profile.get(c, {}).get("status") == "unassessed"]
+    max_turns = len(checklist) if checklist else 15
 
-    if not unprobed or (checklist and turns_used >= len(checklist)) or turns_used >= 15:
+    if not unprobed or turns_used >= max_turns:
         return "finalize_node"
     return "ask_node"
 

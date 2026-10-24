@@ -1,7 +1,7 @@
 import logging
 import uuid
 from datetime import datetime, timezone
-from typing import Optional, Any
+from typing import Optional, Any, Dict, List
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update
@@ -9,7 +9,7 @@ from pydantic import BaseModel
 
 from app.db.postgres import get_db
 from app.db.mongo import get_mongo_db
-from app.db.redis_client import get_redis_checkpointer
+from app.db.redis_client import get_redis_checkpointer, get_redis_client
 from app.core.dependencies import get_current_user
 from app.db.models import User, DiagnosticSession
 from app.engine.curriculum_engine import get_diagnostic_checklist
@@ -34,6 +34,7 @@ from app.llm.stream_events import (
 
 class StartDiagnosticSchema(BaseModel):
     topic: str
+    session_id: Optional[str] = None
 
 class AnswerDiagnosticSchema(BaseModel):
     session_id: str
@@ -43,6 +44,162 @@ class AnswerDiagnosticSchema(BaseModel):
 class OptOutDiagnosticSchema(BaseModel):
     session_id: str
 
+
+async def persist_diagnostic_state(session_id: str, state_vals: Dict[str, Any], mongo_db: Any = None):
+    """Caches diagnostic state in Redis and persists to MongoDB for durability across restarts."""
+    try:
+        redis_c = get_redis_client()
+        if redis_c:
+            await redis_c.set(f"diag_state:{session_id}", json.dumps(state_vals), ex=86400 * 30)
+    except Exception as re_err:
+        logger.warning(f"Failed to cache state in Redis: {re_err}")
+
+    if mongo_db:
+        try:
+            col = mongo_db.get_collection("diagnostic_states")
+            await col.update_one(
+                {"_id": session_id},
+                {"$set": {"_id": session_id, "state": state_vals, "updated_at": datetime.now(timezone.utc).isoformat()}},
+                upsert=True
+            )
+        except Exception as mg_err:
+            logger.warning(f"Failed to persist state in MongoDB: {mg_err}")
+
+
+async def get_or_restore_diagnostic_state(
+    session_id: str,
+    db: AsyncSession,
+    mongo_db: Any,
+    checkpointer: Any
+) -> Optional[Dict[str, Any]]:
+    """
+    Retrieves the LangGraph checkpoint state for a diagnostic session.
+    If checkpoint was evicted or lost from memory (e.g. after server restart),
+    it dynamically restores and hydrates the state from Redis, MongoDB, and PostgreSQL.
+    """
+    thread_config = {"configurable": {"thread_id": session_id}}
+    graph_app = build_diagnostic_graph(checkpointer)
+
+    current_state = await graph_app.aget_state(thread_config)
+    if current_state and current_state.values:
+        return current_state.values
+
+    async def _safe_update_graph(cfg, data):
+        try:
+            await graph_app.aupdate_state(cfg, data, as_node="ask_node")
+        except Exception:
+            try:
+                await graph_app.aupdate_state(cfg, data)
+            except Exception as _err:
+                logger.warning(f"aupdate_state warning (non-fatal): {_err}")
+
+    # 1. Try Redis cache
+    redis_c = get_redis_client()
+    if redis_c:
+        try:
+            cached_json = await redis_c.get(f"diag_state:{session_id}")
+            if cached_json:
+                state_data = json.loads(cached_json)
+                await _safe_update_graph(thread_config, state_data)
+                logger.info(f"[restore_state] Restored session {session_id} from Redis cache.")
+                return state_data
+        except Exception as re_err:
+            logger.warning(f"Redis state lookup error: {re_err}")
+
+    # 2. Try MongoDB persistence
+    if mongo_db:
+        try:
+            col = mongo_db.get_collection("diagnostic_states")
+            doc = await col.find_one({"_id": session_id})
+            if doc and "state" in doc and doc["state"]:
+                state_data = doc["state"]
+                await _safe_update_graph(thread_config, state_data)
+                logger.info(f"[restore_state] Restored session {session_id} from MongoDB.")
+                return state_data
+        except Exception as mg_err:
+            logger.warning(f"MongoDB state lookup error: {mg_err}")
+
+    # 3. Fallback: Restore from PostgreSQL DiagnosticSession
+    try:
+        target_uuid = uuid.UUID(session_id)
+    except (ValueError, TypeError):
+        return None
+
+    stmt = select(DiagnosticSession).where(DiagnosticSession.id == target_uuid)
+    res = await db.execute(stmt)
+    session_record = res.scalar_one_or_none()
+    if not session_record:
+        return None
+
+    logger.info(f"[restore_state] Reconstructing state for session {session_id} from PostgreSQL record.")
+    raw_topic = session_record.topic
+    kp = dict(session_record.knowledge_profile or {})
+    turns_used = session_record.turns_used or 0
+
+    # Retrieve checklist
+    checklist_items = await get_diagnostic_checklist(
+        topic=raw_topic,
+        mongo_db=mongo_db,
+        user_id=session_record.user_id
+    )
+    concept_checklist = [item["concept_id"] for item in checklist_items]
+    if not kp:
+        kp = {c: {"confidence": 0.0, "status": "unassessed"} for c in concept_checklist}
+
+    # Find the first unassessed concept
+    unassessed = [c for c in concept_checklist if kp.get(c, {}).get("status") == "unassessed"]
+    target_concept = unassessed[0] if unassessed else (concept_checklist[0] if concept_checklist else "fundamentals")
+    target_title = target_concept.replace("_", " ").title()
+
+    # Retrieve cached question or fallback
+    topic_slug = raw_topic.strip().lower().replace(" ", "_").replace("-", "_")
+    cache_key = f"diag_q:{topic_slug}:{target_concept}"
+    q_str = None
+    if redis_c:
+        try:
+            q_str = await redis_c.get(cache_key)
+        except Exception:
+            pass
+    if not q_str and mongo_db:
+        try:
+            q_doc = await mongo_db.get_collection("diagnostic_questions").find_one({"_id": cache_key})
+            if q_doc and "question" in q_doc:
+                q_str = q_doc["question"]
+        except Exception:
+            pass
+    if not q_str:
+        q_str = f"Describe your approach, mechanism, and time/space complexity for **{target_title}** in `{raw_topic}`."
+
+    # Build reconstructed state
+    reconstructed_state = {
+        "session_id": session_id,
+        "user_id": str(session_record.user_id),
+        "topic": raw_topic,
+        "concept_checklist": concept_checklist,
+        "knowledge_profile": kp,
+        "current_concept": target_concept,
+        "current_question": q_str,
+        "last_user_answer": None,
+        "turns_used": turns_used,
+        "is_complete": session_record.completed_at is not None,
+        "messages": [{
+            "id": f"m_{turns_used}",
+            "sender": "ai",
+            "text": q_str,
+            "timestamp": datetime.now(timezone.utc).strftime("%I:%M %p")
+        }],
+        "turn_history": []
+    }
+
+    # Hydrate LangGraph state!
+    await _safe_update_graph(thread_config, reconstructed_state)
+
+    # Persist into Redis and Mongo
+    await persist_diagnostic_state(session_id, reconstructed_state, mongo_db)
+
+    return reconstructed_state
+
+
 @router.post("/start", status_code=status.HTTP_200_OK)
 async def start_diagnostic(
     payload: StartDiagnosticSchema,
@@ -51,72 +208,110 @@ async def start_diagnostic(
     mongo_db: Any = Depends(get_mongo_db),
     checkpointer: Any = Depends(get_redis_checkpointer)
 ):
-    """Initializes a new diagnostic session or resumes an existing active diagnostic session checkpointed in Redis."""
+    """Initializes a new diagnostic session or resumes an existing active diagnostic session checkpointed in Redis, MongoDB, or Postgres."""
     import asyncio
     import time
+    from sqlalchemy import or_, func
     t_start = time.monotonic()
     raw_topic = payload.topic.strip()
-    logger.info(f"[start_diagnostic] ▶ START | topic='{raw_topic}' user={current_user.id}")
+    logger.info(f"[start_diagnostic] ▶ START | topic='{raw_topic}' session_id='{payload.session_id}' user={current_user.id}")
 
     try:
-        graph_app = build_diagnostic_graph(checkpointer)
+        existing_session = None
 
-        # Step 1: Check for existing incomplete session for this user and topic in PostgreSQL
-        stmt = (
-            select(DiagnosticSession)
-            .where(
-                DiagnosticSession.user_id == current_user.id,
-                DiagnosticSession.topic == raw_topic,
-                DiagnosticSession.completed_at.is_(None)
+        # Step 1A: If session_id is explicitly provided, look it up directly
+        if payload.session_id:
+            try:
+                target_uuid = uuid.UUID(payload.session_id)
+                stmt = (
+                    select(DiagnosticSession)
+                    .where(
+                        DiagnosticSession.id == target_uuid,
+                        DiagnosticSession.user_id == current_user.id
+                    )
+                )
+                res = await db.execute(stmt)
+                existing_session = res.scalar_one_or_none()
+            except (ValueError, TypeError):
+                existing_session = None
+
+        # Step 1B: Check for existing incomplete session for this user and topic in PostgreSQL
+        if not existing_session:
+            topic_clean = raw_topic.lower().replace("_", " ").replace("-", " ")
+            topic_slug = topic_clean.replace(" ", "_")
+            topic_hyphen = topic_clean.replace(" ", "-")
+            stmt = (
+                select(DiagnosticSession)
+                .where(
+                    DiagnosticSession.user_id == current_user.id,
+                    or_(
+                        DiagnosticSession.topic == raw_topic,
+                        func.lower(DiagnosticSession.topic) == raw_topic.lower(),
+                        func.lower(func.replace(func.replace(DiagnosticSession.topic, "_", " "), "-", " ")) == topic_clean,
+                        func.lower(func.replace(DiagnosticSession.topic, " ", "_")) == topic_slug,
+                        func.lower(func.replace(DiagnosticSession.topic, " ", "-")) == topic_hyphen
+                    ),
+                    DiagnosticSession.completed_at.is_(None)
+                )
+                .order_by(DiagnosticSession.turns_used.desc())
             )
-            .order_by(DiagnosticSession.id.desc())
-        )
-        res = await db.execute(stmt)
-        existing_session = res.scalars().first()
+            res = await db.execute(stmt)
+            existing_session = res.scalars().first()
 
         if existing_session:
             session_id = str(existing_session.id)
-            thread_config = {"configurable": {"thread_id": session_id}}
-            current_state = await graph_app.aget_state(thread_config)
+            state_vals = await get_or_restore_diagnostic_state(session_id, db, mongo_db, checkpointer)
+            if not state_vals:
+                state_vals = {}
 
-            if current_state and current_state.values:
-                state_vals = current_state.values
-                logger.info(f"[start_diagnostic] 🔄 RESUMING existing active session {session_id} at turn {state_vals.get('turns_used', 1)}")
+            logger.info(f"[start_diagnostic] 🔄 RESUMING existing session {session_id} at turn {state_vals.get('turns_used', existing_session.turns_used)}")
 
-                # Sync user_topics mode_choice in MongoDB
-                if mongo_db:
-                    try:
-                        from app.engine.curriculum_engine import get_or_create_user_topic
-                        topic_doc = await get_or_create_user_topic(current_user.id, raw_topic, mongo_db)
-                        ut_collection = mongo_db.get_collection("user_topics")
-                        await ut_collection.update_one(
-                            {"user_id": str(current_user.id), "topic_slug": topic_doc["topic_slug"]},
-                            {"$set": {"mode_choice": "diagnostic", "diagnostic_session_id": session_id, "updated_at": datetime.now(timezone.utc).isoformat()}}
-                        )
-                    except Exception as ut_err:
-                        logger.warning(f"Failed to update user_topics mode_choice: {ut_err}")
+            # Sync user_topics mode_choice in MongoDB
+            if mongo_db:
+                try:
+                    from app.engine.curriculum_engine import get_or_create_user_topic
+                    topic_doc = await get_or_create_user_topic(current_user.id, raw_topic, mongo_db)
+                    ut_collection = mongo_db.get_collection("user_topics")
+                    await ut_collection.update_one(
+                        {"user_id": str(current_user.id), "topic_slug": topic_doc["topic_slug"]},
+                        {"$set": {"mode_choice": "diagnostic", "diagnostic_session_id": session_id, "updated_at": datetime.now(timezone.utc).isoformat()}}
+                    )
+                except Exception as ut_err:
+                    logger.warning(f"Failed to update user_topics mode_choice: {ut_err}")
 
-                res_concept = state_vals.get("current_concept") or "fundamentals"
-                res_title = res_concept.replace("_", " ").title()
-                res_turn = state_vals.get("turns_used", 1)
-                return {
-                    "session_id": session_id,
-                    "turn": res_turn,
-                    "current_concept": res_concept,
-                    "current_question": state_vals.get("current_question"),
-                    "is_complete": state_vals.get("is_complete", False),
-                    "knowledge_profile": state_vals.get("knowledge_profile", {}),
-                    "messages": state_vals.get("messages", []),
-                    "turn_history": state_vals.get("turn_history", []),
-                    "is_resumed": True,
-                    "user_input": {
-                        "input_id": f"diag_input_{session_id}_{res_turn}",
-                        "type": "text",
-                        "label": f"Concept Probe: {res_title}",
-                        "description": "Explain your approach, mechanism, and time/space complexity.",
-                        "required": True
-                    }
+            kp = state_vals.get("knowledge_profile") or existing_session.knowledge_profile or {}
+            res_turn = state_vals.get("turns_used") or existing_session.turns_used or 1
+            res_concept = state_vals.get("current_concept") or "fundamentals"
+            res_title = res_concept.replace("_", " ").title()
+            res_question = state_vals.get("current_question") or f"Explain your approach and complexity for **{res_title}**."
+
+            messages = state_vals.get("messages", [])
+            if not messages:
+                messages = [{
+                    "id": f"m_{res_turn}",
+                    "sender": "ai",
+                    "text": res_question,
+                    "timestamp": datetime.now(timezone.utc).strftime("%I:%M %p")
+                }]
+
+            return {
+                "session_id": session_id,
+                "turn": res_turn,
+                "current_concept": res_concept,
+                "current_question": res_question,
+                "is_complete": state_vals.get("is_complete", existing_session.completed_at is not None),
+                "knowledge_profile": kp,
+                "messages": messages,
+                "turn_history": state_vals.get("turn_history", []),
+                "is_resumed": True,
+                "user_input": {
+                    "input_id": f"diag_input_{session_id}_{res_turn}",
+                    "type": "text",
+                    "label": f"Concept Probe: {res_title}",
+                    "description": "Explain your approach, mechanism, and time/space complexity.",
+                    "required": True
                 }
+            }
 
         # Step 2: Create brand new diagnostic session
         checklist_items = await get_diagnostic_checklist(
@@ -128,6 +323,7 @@ async def start_diagnostic(
         concept_checklist = [item["concept_id"] for item in checklist_items]
         session_id = str(uuid.uuid4())
         thread_config = {"configurable": {"thread_id": session_id}}
+        graph_app = build_diagnostic_graph(checkpointer)
         initial_knowledge_profile = {c: {"confidence": 0.0, "status": "unassessed"} for c in concept_checklist}
 
         initial_state = {
@@ -219,14 +415,15 @@ async def answer_diagnostic(
     payload: AnswerDiagnosticSchema,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    mongo_db: Any = Depends(get_mongo_db),
     checkpointer: Any = Depends(get_redis_checkpointer)
 ):
     """Resumes the LangGraph thread, evaluates answer, and returns next question or final profile."""
     thread_config = {"configurable": {"thread_id": payload.session_id}}
     graph_app = build_diagnostic_graph(checkpointer)
     
-    current_state = await graph_app.aget_state(thread_config)
-    if not current_state.values:
+    current_state_vals = await get_or_restore_diagnostic_state(payload.session_id, db, mongo_db, checkpointer)
+    if not current_state_vals:
         raise HTTPException(status_code=404, detail="Session expired or not found.")
 
     # Resume graph execution with the user's answer
@@ -255,9 +452,12 @@ async def answer_diagnostic(
     await db.execute(stmt)
     await db.commit()
 
+    # Persist state to Redis & MongoDB for durability
+    await persist_diagnostic_state(payload.session_id, updated_state, mongo_db)
+
     evaluated_concept = (
         updated_state.get('last_evaluated_concept')
-        or current_state.values.get('current_concept')
+        or current_state_vals.get('current_concept')
     )
     concept_feedback = (
         updated_state.get('last_evaluated_feedback')
@@ -300,13 +500,14 @@ async def answer_diagnostic(
 async def stream_diagnostic_answer_generator(
     payload: AnswerDiagnosticSchema,
     db: AsyncSession,
-    checkpointer: Any
+    checkpointer: Any,
+    mongo_db: Any = None
 ):
     thread_config = {"configurable": {"thread_id": payload.session_id}}
     graph_app = build_diagnostic_graph(checkpointer)
 
-    current_state = await graph_app.aget_state(thread_config)
-    if not current_state.values:
+    current_state_vals = await get_or_restore_diagnostic_state(payload.session_id, db, mongo_db, checkpointer)
+    if not current_state_vals:
         err_event = ErrorEvent(message="Session expired or not found.", code="SESSION_NOT_FOUND")
         yield format_sse(err_event)
         yield f"data: {json.dumps({'event': 'error', 'message': 'Session expired or not found.'})}\n\n"
@@ -332,7 +533,7 @@ async def stream_diagnostic_answer_generator(
     yield format_sse(MessageStartEvent(
         session_id=payload.session_id,
         role="assistant",
-        metadata={"turn": current_state.values.get("turns_used", 0) + 1}
+        metadata={"turn": current_state_vals.get("turns_used", 0) + 1}
     ))
 
     # 1. Resume graph execution to evaluate answer (score_node)
@@ -372,10 +573,13 @@ async def stream_diagnostic_answer_generator(
     await db.execute(stmt)
     await db.commit()
 
+    # Persist state to Redis & MongoDB for durability
+    await persist_diagnostic_state(payload.session_id, updated_state, mongo_db)
+
     # Emit evaluation tool completion & evaluation events
     evaluated_concept = (
         updated_state.get('last_evaluated_concept')
-        or current_state.values.get('current_concept')
+        or current_state_vals.get('current_concept')
         or updated_state.get('current_concept')
     )
     concept_feedback = (
@@ -565,6 +769,7 @@ async def answer_diagnostic_stream(
     payload: AnswerDiagnosticSchema,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    mongo_db: Any = Depends(get_mongo_db),
     checkpointer: Any = Depends(get_redis_checkpointer)
 ):
     """
@@ -572,7 +777,7 @@ async def answer_diagnostic_stream(
     Evaluates user answer and streams the next diagnostic question text chunk-by-chunk.
     """
     return StreamingResponse(
-        stream_diagnostic_answer_generator(payload, db, checkpointer),
+        stream_diagnostic_answer_generator(payload, db, checkpointer, mongo_db),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -586,17 +791,18 @@ async def opt_out(
     payload: OptOutDiagnosticSchema,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    mongo_db: Any = Depends(get_mongo_db),
     checkpointer: Any = Depends(get_redis_checkpointer)
 ):
     """Skips all 15 diagnostic turns and marks all concepts unknown for beginners."""
     thread_config = {"configurable": {"thread_id": payload.session_id}}
     graph_app = build_diagnostic_graph(checkpointer)
     
-    current_state = await graph_app.aget_state(thread_config)
-    if not current_state.values:
+    current_state_vals = await get_or_restore_diagnostic_state(payload.session_id, db, mongo_db, checkpointer)
+    if not current_state_vals:
         raise HTTPException(status_code=404, detail="Session not found.")
 
-    checklist = current_state.values.get("concept_checklist", [])
+    checklist = current_state_vals.get("concept_checklist", [])
     zero_profile = {c: {"confidence": 0.0, "status": "unassessed"} for c in checklist}
 
     await graph_app.aupdate_state(
@@ -626,18 +832,29 @@ async def get_active_diagnostic_session(
     topic: str,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    mongo_db: Any = Depends(get_mongo_db),
     checkpointer: Any = Depends(get_redis_checkpointer)
 ):
     """Retrieves active incomplete diagnostic session for the user and topic."""
     raw_topic = topic.strip()
+    topic_clean = raw_topic.lower().replace("_", " ").replace("-", " ")
+    topic_slug = topic_clean.replace(" ", "_")
+    topic_hyphen = topic_clean.replace(" ", "-")
+    from sqlalchemy import or_, func
     stmt = (
         select(DiagnosticSession)
         .where(
             DiagnosticSession.user_id == current_user.id,
-            DiagnosticSession.topic == raw_topic,
+            or_(
+                DiagnosticSession.topic == raw_topic,
+                func.lower(DiagnosticSession.topic) == raw_topic.lower(),
+                func.lower(func.replace(func.replace(DiagnosticSession.topic, "_", " "), "-", " ")) == topic_clean,
+                func.lower(func.replace(DiagnosticSession.topic, " ", "_")) == topic_slug,
+                func.lower(func.replace(DiagnosticSession.topic, " ", "-")) == topic_hyphen
+            ),
             DiagnosticSession.completed_at.is_(None)
         )
-        .order_by(DiagnosticSession.id.desc())
+        .order_by(DiagnosticSession.turns_used.desc())
     )
     res = await db.execute(stmt)
     session_record = res.scalars().first()
@@ -646,10 +863,9 @@ async def get_active_diagnostic_session(
         raise HTTPException(status_code=404, detail=f"No active diagnostic session for topic '{raw_topic}'.")
 
     session_id = str(session_record.id)
-    thread_config = {"configurable": {"thread_id": session_id}}
-    graph_app = build_diagnostic_graph(checkpointer)
-    current_state = await graph_app.aget_state(thread_config)
-    state_vals = current_state.values if current_state else {}
+    state_vals = await get_or_restore_diagnostic_state(session_id, db, mongo_db, checkpointer)
+    if not state_vals:
+        state_vals = {}
 
     return {
         "session_id": session_id,
@@ -671,6 +887,7 @@ async def get_diagnostic_state(
     session_id: str,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    mongo_db: Any = Depends(get_mongo_db),
     checkpointer: Any = Depends(get_redis_checkpointer)
 ):
     """Retrieves state and chat history of a diagnostic session."""
@@ -686,10 +903,9 @@ async def get_diagnostic_state(
     if not session_record:
         raise HTTPException(status_code=404, detail="Diagnostic session not found.")
 
-    thread_config = {"configurable": {"thread_id": session_id}}
-    graph_app = build_diagnostic_graph(checkpointer)
-    current_state = await graph_app.aget_state(thread_config)
-    state_vals = current_state.values if current_state else {}
+    state_vals = await get_or_restore_diagnostic_state(session_id, db, mongo_db, checkpointer)
+    if not state_vals:
+        state_vals = {}
 
     return {
         "session_id": str(session_record.id),

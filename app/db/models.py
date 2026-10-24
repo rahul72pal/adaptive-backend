@@ -121,6 +121,29 @@ class UserTopic(Base):
 
     user = relationship("User", back_populates="user_topics")
 
+class TopicCatalog(Base):
+    __tablename__ = "topic_catalog"
+
+    id = Column(String, primary_key=True)  # stable topic_id, e.g. "t_08_binary_search"
+    name = Column(String, nullable=False, index=True)
+    description = Column(String, nullable=False, default="")
+    category_id = Column(String, nullable=False, index=True)
+    category_name = Column(String, nullable=False)
+    kind = Column(String, nullable=False, default="technique")
+    scope = Column(String, nullable=False, default="topic")
+    supported_levels = Column(JSONType, nullable=False, default=list)
+    default_target_level = Column(String, nullable=False, default="expert")
+    assessment_mode = Column(String, nullable=False, default="mixed")
+    applicable_languages = Column(JSONType, nullable=False, default=list)
+    pattern_tags = Column(JSONType, nullable=False, default=list)
+    prerequisite_topic_ids = Column(JSONType, nullable=False, default=list)
+    aliases = Column(JSONType, nullable=False, default=list)
+    target_node_count = Column(Integer, nullable=False, default=8)
+    metadata_version = Column(Integer, nullable=False, default=1)
+    metadata_json = Column(JSONType, nullable=False, default=dict)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
 # ==========================================
 # 2. MONGODB DOCUMENT SCHEMAS (Pydantic)
 # ==========================================

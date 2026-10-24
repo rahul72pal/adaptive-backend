@@ -25,6 +25,16 @@ async def lifespan(app: FastAPI):
     await init_db()
     await init_mongo()
     await init_redis()
+    try:
+        from app.services.topic_catalog_service import get_catalog_service
+        from app.db.postgres import AsyncSessionLocal
+        from app.db.mongo import get_mongo_db
+        cat_svc = get_catalog_service()
+        if AsyncSessionLocal is not None:
+            async with AsyncSessionLocal() as session:
+                await cat_svc.sync_to_database(db=session, mongo_db=get_mongo_db())
+    except Exception as sync_err:
+        logger.warning(f"Catalog sync on startup: {sync_err}")
     logger.info("Adaptive Platform Backend startup complete.")
     yield
     logger.info("Adaptive Platform Backend shutting down...")

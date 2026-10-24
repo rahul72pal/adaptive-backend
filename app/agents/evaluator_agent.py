@@ -50,7 +50,14 @@ class AnswerEvaluatorAgent:
         return False
 
     @classmethod
-    async def evaluate(cls, concept: str, question: str, answer: str) -> EvaluatorGradeSchema:
+    async def evaluate(
+        cls,
+        concept: str,
+        question: str,
+        answer: str,
+        topic_kind: str = "technique",
+        assessment_mode: str = "mixed"
+    ) -> EvaluatorGradeSchema:
         raw_ans = (answer or "").strip()
 
         # 1. Deterministic fast-path: Handle explicit 'not know' or blank answers
@@ -72,10 +79,23 @@ class AnswerEvaluatorAgent:
                 {
                     "concept": concept,
                     "question": question,
-                    "answer": raw_ans
+                    "answer": raw_ans,
+                    "topic_kind": topic_kind,
+                    "assessment_mode": assessment_mode,
                 },
                 EvaluatorGradeSchema
             )
+            # Enforce continuous, gapless score boundaries
+            conf = min(1.0, max(0.0, float(res.confidence)))
+            if conf >= 0.80:
+                calc_status = "known"
+            elif conf >= 0.40:
+                calc_status = "partial"
+            else:
+                calc_status = "unknown"
+            res.confidence = round(conf, 2)
+            res.status = calc_status
+
             logger.info(
                 f"[AnswerEvaluatorAgent] Evaluated '{concept}': confidence={res.confidence}, "
                 f"status={res.status}, mech={res.mechanism_correct}, compl={res.complexity_correct}"

@@ -23,27 +23,37 @@ Key changes from the generic version:
 from langchain_core.prompts import ChatPromptTemplate
 
 # ---------------------------------------------------------------------------
-# 0. DIAGNOSTIC CHECKLIST — fast 1-call concept probe list for diagnostics
+# 0. DIAGNOSTIC CHECKLIST — fast concept probe list for diagnostics
 # ---------------------------------------------------------------------------
 
 DIAGNOSTIC_CHECKLIST_PROMPT = ChatPromptTemplate.from_messages([
     (
         "system",
-        """You are a DSA curriculum expert. Generate exactly 15 DSA concept_ids to probe a student's knowledge of "{topic}".
+        """You are an expert curriculum architect. Generate a list of concept_ids to probe a student's knowledge of "{topic}".
+
+TOPIC CONTEXT:
+Topic: {topic}
+Kind: {topic_kind}
+Assessment Mode: {assessment_mode}
+Target Probe Count: {max_probes}
 
 RULES:
-1. Return ONLY raw valid JSON — no markdown, no backticks, no prose.
-2. Generate exactly 15 concept_ids distributed: 4 beginner + 4 intermediate + 4 advanced + 3 expert.
-3. concept_id: snake_case, specific, e.g. array_two_pointer_pattern (not just "arrays" or "basic").
-4. Cover the most important/interview-relevant concepts for this DSA topic at each level.
-5. Beginner: core mechanics/operations. Intermediate: patterns/techniques. Advanced: optimization/variants. Expert: specialized algorithms.
+1. Return ONLY raw valid JSON — no markdown, no backticks, no prose before or after.
+2. Generate EXACTLY {max_probes} concept_ids distributed across proficiency levels:
+   - beginner: core terminology, data/concept structure, basic mechanics
+   - intermediate: canonical patterns, typical problem variations, standard techniques
+   - advanced: edge-case optimizations, advanced variants, trade-off analysis
+   - expert: specialized algorithms, novel extensions, or complex edge scenarios
+3. concept_id: snake_case, specific, descriptive (e.g. binary_search_lower_bound, not just "search").
+4. Cover the most important/interview-relevant concepts for this specific topic kind.
+5. If the topic is conceptual/math, focus on theoretical foundations, invariants, and mathematical mechanics. If code-based, focus on algorithmic mechanisms and complexity.
 
 Output this JSON structure exactly:
 {{"topic": "{topic}", "concepts": [{{"concept_id": "...", "level": "beginner|intermediate|advanced|expert"}}]}}"""
     ),
     (
         "user",
-        "Generate the 15-concept diagnostic checklist for topic: {topic}"
+        "Generate the {max_probes}-concept diagnostic checklist for topic: {topic}"
     )
 ])
 
@@ -54,35 +64,29 @@ Output this JSON structure exactly:
 DIAGNOSTIC_ASK_PROMPT = ChatPromptTemplate.from_messages([
     (
         "system",
-        """You are an expert DSA (Data Structures & Algorithms) interviewer probing a
-student's real understanding of the concept: '{concept}', within the topic {topic}.
+        """You are an expert technical interviewer probing a student's real understanding of the concept: '{concept}', within the topic: '{topic}'.
+
+TOPIC CONTEXT & ASSESSMENT DIRECTIVES:
+- Topic Kind: {topic_kind}
+- Assessment Mode: {assessment_mode}
+- Target Language (if code): {selected_language}
 
 Your task is to generate ONE precise, highly targeted diagnostic question.
 
 Question Guidelines:
-1. Test Mechanism, Not Definition: Never ask "What is a {concept}?" or other
-   textbook-recall questions. Ask about the underlying mechanism, memory
-   layout, or operational behavior instead.
-2. Always Probe Complexity: Where applicable, the question must require the
-   student to state or reason about time and/or space complexity — this is
-   the single strongest signal of real DSA understanding vs memorized
-   definitions.
-3. Prefer a Concrete Trace: Where possible, frame the question around a
-   specific small example the student must reason through (e.g. "Given the
-   array [5, 3, 8, 1], walk through how a two-pointer approach would find
-   a pair summing to 9 — what's the time complexity?") rather than an
-   abstract question with no data to anchor to.
-4. Concise & Direct Answerability: The question must be answerable in 2-4
-   precise sentences so capability can be accurately evaluated without the
-   student needing to write full code.
-5. Do Not Test Adjacent Concepts: Stay strictly scoped to '{concept}' —
-   don't require knowledge of prerequisite or downstream concepts to answer.
-6. Standard Markdown Formatting: The "question" string MUST be formatted strictly in clean standard GitHub Flavored Markdown. Use bold (**keyword**) for key requirements, inline code (`variable`, `O(n)`) for parameters and complexity, and fenced code blocks (` ```python ... ``` `) if providing sample inputs or snippets.
-   IMPORTANT: Use single quotes `'...'` inside inline code snippets or code blocks (e.g., `s = '((()))'`). NEVER use unescaped double quotes inside string values as they break JSON formatting.
+1. Test Deep Understanding, Not Rote Definition:
+   Never ask "What is {concept}?" or textbook definitions. Probe the underlying mechanism, invariant, mathematical reasoning, or operational state transitions.
+2. Assessment Mode Directives:
+   - If assessment_mode is 'code' or 'mixed': Probe the mechanical state trace, memory behavior, or time/space complexity. Frame the question around a small concrete example.
+   - If assessment_mode is 'conceptual_only' or topic is theoretical: Probe logical correctness, boundary conditions, correctness invariant, or mathematical reasoning. Do NOT demand irrelevant code execution or Big-O if not applicable to this concept.
+3. Concise & Direct Answerability:
+   The question must be answerable in 2-4 precise sentences so capability can be accurately evaluated without the student needing to write an entire code file.
+4. Strictly Scoped:
+   Stay strictly focused on '{concept}' — do not require knowledge of unrelated concepts.
+5. Standard Markdown Formatting:
+   The "question" string MUST be formatted strictly in clean standard GitHub Flavored Markdown. Use bold (**keyword**) for key requirements, inline code (`variable`, `O(n)`) for parameters, and single quotes `'...'` inside code snippets. NEVER use unescaped double quotes inside string values.
 
-CRITICAL FORMAT REQUIREMENT: Respond ONLY with a valid JSON object matching the format instructions. Do NOT include any intro text, reasoning prose, or conversational commentary outside the JSON. All string values MUST have any internal double quotes escaped or replaced with single quotes.
-
-Return structured JSON following format instructions:
+CRITICAL FORMAT REQUIREMENT: Respond ONLY with a valid JSON object matching the format instructions.
 {format_instructions}"""
     ),
     (
@@ -100,25 +104,29 @@ Turn: {history}"""
 EVALUATOR_AGENT_PROMPT = ChatPromptTemplate.from_messages([
     (
         "system",
-        """You are a technical DSA Evaluator grading a student's answer for '{concept}'.
+        """You are a technical assessment evaluator objectively grading a student's answer for '{concept}'.
 Carefully analyze the Question asked and the Student's Answer.
 
-Grading Criteria:
-1. Mechanism Correctness: Does the student accurately describe how the data structure or algorithm functions?
-2. Complexity Correctness: Does the student correctly identify the Big-O time and/or space complexity required by the question?
+Assessment Context:
+- Topic Kind: {topic_kind}
+- Assessment Mode: {assessment_mode}
 
-Scoring Rubric:
+Grading Criteria:
+1. Mechanism / Conceptual Correctness: Does the student accurately describe how the concept/algorithm operates or correctly state the core invariant/reasoning?
+2. Complexity / Quantitative Precision: If Big-O time/space complexity or mathematical bound was asked or expected for this concept, is it stated accurately? (If the question or topic is conceptual/math and did not require Big-O, mark complexity_correct as true).
+
+Scoring Rubric (Enforce continuous, explicit boundaries with NO gaps):
 - Known (confidence: 0.80 to 1.00, status: 'known'):
-  Both the algorithmic mechanism AND time/space complexity are correct and clearly stated.
+  The mechanism/conceptual foundation is correct and clearly stated. If complexity was applicable, it is also correct.
   Set mechanism_correct = true, complexity_correct = true, status = 'known'.
-- Partial (confidence: 0.40 to 0.75, status: 'partial'):
-  The mechanism is mostly correct, but time/space complexity is missing, vague, or inaccurate.
+- Partial (confidence: 0.40 to 0.79, status: 'partial'):
+  The core mechanism is partially understood or mostly correct, but has minor misconceptions, missing edge cases, or inaccurate complexity.
   Set mechanism_correct = true, complexity_correct = false, status = 'partial'.
-- Unknown (confidence: 0.00 to 0.35, status: 'unknown'):
-  The student's explanation is incorrect, fundamentally confused, or wrong.
+- Unknown (confidence: 0.00 to 0.39, status: 'unknown'):
+  The student's explanation is incorrect, fundamentally confused, or expresses no knowledge.
   Set mechanism_correct = false, status = 'unknown'.
 
-Be objective and fair: If the student correctly answers the question with the right mechanism and complexity, award confidence >= 0.85 and status 'known'.
+Be objective and fair. Award confidence matching the true depth of understanding.
 
 CRITICAL FORMAT REQUIREMENT: Respond ONLY with a valid JSON object matching format instructions.
 {format_instructions}"""
@@ -134,22 +142,14 @@ Student's Answer: {answer}"""
 FEEDBACK_AGENT_PROMPT = ChatPromptTemplate.from_messages([
     (
         "system",
-        """You are an encouraging, world-class DSA Pedagogy & Feedback Specialist Agent.
-Your role is to write clear, constructive, and actionable educational feedback for the student based on:
-1. The question asked.
-2. The student's actual answer.
-3. The technical evaluation verdict (confidence, status, mechanism/complexity correctness, gaps).
+        """You are a concise, encouraging educational Feedback Specialist.
+Your task is to write SHORT, SIMPLE, and DIRECT feedback (strictly 2 to 3 sentences maximum, under 50 words).
 
-Pedagogical Structure (formatted strictly in clean standard GitHub Flavored Markdown):
-- **Assessment**: Acknowledge the student's answer honestly and encouragingly. If they said "not know" or were unsure, validate their honesty and reassure them that this diagnostic is specifically designed to identify areas for rapid growth.
-- **Core Mechanism**: Explain how this concept or operation actually works in 2-3 clear sentences (e.g., how the top pointer operates, why elements don't shift, etc.).
-- **Complexity & Operations**: Explicitly state the exact Big-O Time and Space complexities and answer any concrete scenarios in the question (e.g., explain why popping an element from a stack of 1,000 items takes exactly 1 operation and O(1) time).
-- **Key Takeaway**: One crisp, memorable bullet point summarizing what to remember for technical interviews.
-
-Writing Guidelines:
-- If the student answered "not know", teach them the solution directly so they learn immediately!
-- If the student had a misconception (e.g. guessed O(n)), clearly explain why it is constant time or what caused the confusion.
-- Never use generic placeholder text like "Response evaluated and confidence updated." Always give concrete DSA facts.
+Guidelines:
+1. Verdict: In 1 short sentence, state whether the answer was correct, partially correct, or missing key elements.
+2. Core Takeaway: In 1-2 concise sentences, state the correct mechanism, core invariant, or complexity for '{concept}'.
+3. Tone: Encouraging, supportive, and punchy.
+4. DO NOT write long essays or verbose section headers. Keep it clean and easy to read at a glance!
 
 CRITICAL FORMAT REQUIREMENT: Respond ONLY with a valid JSON object matching the format instructions.
 {format_instructions}"""
@@ -170,21 +170,26 @@ Evaluation Grade:
 ])
 
 DIAGNOSTIC_SCORE_PROMPT = ChatPromptTemplate.from_template(
-    """You are an expert DSA interviewer assessing a student's answer for the concept '{concept}'.
+    """You are an expert interviewer assessing a student's answer for the concept '{concept}'.
 Question asked: {question}
 Student's answer: '{answer}'
 
-Grade against these specific signals, not general impression:
-1. Correctness of the core mechanism/trace described.
-2. Correctness of any time/space complexity claim made or implied — a student who gets the mechanism right but states the wrong Big-O should NOT score as "known."
-3. If the student says "not know", "i don't know", "idk", or expresses no knowledge, confidence MUST be 0.0 and status MUST be 'unknown'.
+Grade against these objective criteria:
+1. Correctness of the core mechanism, invariant, or conceptual reasoning described.
+2. Correctness of complexity claims where applicable.
+3. If the student indicates no knowledge ("not know", "idk", blank), confidence MUST be 0.0 and status MUST be 'unknown'.
+
+Rubric Boundaries:
+- 'known': confidence in [0.80, 1.00]
+- 'partial': confidence in [0.40, 0.79]
+- 'unknown': confidence in [0.00, 0.39]
 
 Assign:
-- confidence score from 0.0 (complete misconception/no knowledge) to 1.0 (mechanism + complexity both correct and precisely reasoned).
-- status ('known' if confidence >= 0.8, 'partial' if 0.4 <= confidence < 0.8, 'unknown' if confidence < 0.4).
-- constructive brief feedback written strictly in clean standard Markdown.
+- confidence score from 0.0 to 1.0.
+- status ('known', 'partial', 'unknown').
+- constructive brief feedback in clean standard Markdown.
 
-CRITICAL FORMAT REQUIREMENT: Respond ONLY with a valid JSON object matching the format instructions.
+CRITICAL FORMAT REQUIREMENT: Respond ONLY with a valid JSON object matching format instructions.
 {format_instructions}"""
 )
 
@@ -196,34 +201,47 @@ CRITICAL FORMAT REQUIREMENT: Respond ONLY with a valid JSON object matching the 
 CURRICULUM_GRAPH_PROMPT = ChatPromptTemplate.from_messages([
     (
         "system",
-        """You are a DSA Curriculum Architect. Generate a concept learning graph for a DSA adaptive learning platform.
+        """You are a Curriculum Architect. Generate a concept learning graph for an adaptive learning platform.
 
-MANDATORY RULES (all must be followed):
+MANDATORY RULES:
 1. OUTPUT: Return ONLY raw valid JSON — no markdown, no backticks, no prose before/after.
-2. NODE COUNT: Generate EXACTLY 8 distinct concept nodes (5-6 learning nodes + 2-3 practice nodes) for this level. Every node must be granular and focused on a single specific DSA concept or practice problem.
-3. SCOPE: Generate ONLY concepts for level "{target_level}" of topic "{topic}". Do NOT recreate any concept_id from the excluded list.
+2. NODE COUNT: Generate {target_node_count} distinct concept nodes ({learning_count} learning nodes + {practice_count} practice nodes) for this level. Every node must be granular and focused on a single specific concept or practice milestone.
+3. SCOPE & TAXONOMY:
+   - Topic: "{topic}" | Kind: {topic_kind} | Granularity Scope: {topic_scope}
+   - Assessment Mode: {assessment_mode}
+   - Generate ONLY concepts for level "{target_level}".
+   - Do NOT recreate any concept_id from the excluded list.
+   - For broad topics, decompose into representative foundational pillars.
+   - For leaf algorithms (e.g. Kadane's algorithm), focus on algorithm variants, invariants, and edge cases without unnecessary bloat.
+   - For concrete interview problems, preserve problem constraints, modeling transformations, and optimizations.
+   - For theoretical or systems-practice topics, focus on conceptual models and operational characteristics.
 4. concept_id: Unique, snake_case, descriptive (e.g. array_prefix_sum). No duplicates.
 5. depends_on: Reference valid concept_ids from this graph OR excluded (previous) list. No cycles, no self-deps. Root nodes use [].
 6. node_type — "learning": teaches a concept/mechanism/complexity. "practice": assesses via problems/implementation. Practice nodes must depend on their prerequisite learning nodes.
-7. pattern: Use canonical DSA pattern or "none". Valid tags: two_pointer, sliding_window, fast_slow_pointer, dfs, bfs, backtracking, dp_1d, dp_2d, greedy, binary_search, prefix_sum, divide_conquer, heap, union_find, bit_manipulation, topological_sort, trie. Use a descriptive string for unlisted patterns.
+7. pattern: Use canonical pattern tag or "none" (e.g. two_pointer, sliding_window, dfs, bfs, dp_1d, greedy, binary_search, or topic-appropriate tag).
 8. concept_type: "code" | "math" | "conceptual" | "mcq" | "short_answer"
-9. DIVERSIFICATION FOR PRACTICE NODES: Practice nodes MUST feature a diverse mix of concept_types ("code", "mcq", "conceptual", "short_answer", "math"). Do NOT default all practice nodes to "code". Combine coding challenges with conceptual mechanism analysis and quantitative complexity calculation practice nodes.
+9. PRACTICE NODES SPECIFICATION:
+   - If assessment_mode is "conceptual_only": Practice nodes MUST feature conceptual, mcq, short_answer, or math concept_types. Do NOT force code execution.
+   - If assessment_mode is "code" or "mixed": Combine coding challenges with conceptual mechanism analysis and quantitative complexity calculation.
 10. Defaults for new nodes — status: "learning", action: "full_teach", target_question_count: 0 for learning / 3-5 for practice.
-10. QUALITY: Each node must be independently teachable and assessable, DSA-specific, and interview-relevant. No generic fillers (basic_operations, common_patterns, real_world_applications, traversal_mechanisms).
-11. COMPLEXITY: Learning nodes must address time/space complexity where meaningful.
+11. QUALITY: Each node must be independently teachable and assessable. Avoid generic fillers (e.g. basic_operations, common_patterns).
+12. COMPLEXITY: Learning nodes must address time/space complexity or mathematical bounds where meaningful.
 
 LEVEL GUIDANCE for "{target_level}":
-- beginner: core terminology, data layout/mechanics, basic operations, simple implementation, O-notation basics
-- intermediate: canonical patterns, standard LeetCode-style problem families, combining foundational concepts
-- advanced: optimization, edge-case reasoning, advanced variants, non-obvious problem transformations
-- expert: specialized algorithms, multi-pattern combinations, novel problem design, trade-off analysis
+- beginner: core terminology, data/concept mechanics, basic operations, simple implementation, foundational bounds
+- intermediate: canonical patterns, typical problem variations, standard techniques, combining foundational concepts
+- advanced: optimization, edge-case reasoning, advanced variants, trade-off analysis
+- expert: specialized extensions, multi-paradigm combinations, novel problem design
 
 {format_instructions}"""
     ),
     (
         "user",
         """Topic: {topic}
+Kind: {topic_kind}
 Level: {target_level}
+Target Nodes: {target_node_count} ({learning_count} learning, {practice_count} practice)
+Assessment Mode: {assessment_mode}
 Excluded concept_ids (DO NOT generate any of these): {previous_level_concepts}
 
 Output the concept graph JSON for "{topic}" at level "{target_level}" now."""
@@ -233,74 +251,41 @@ Output the concept graph JSON for "{topic}" at level "{target_level}" now."""
 LEARNING_CONTENT_PROMPT = ChatPromptTemplate.from_messages([
     (
         "system",
-        """You are a Principal DSA Instructor building interactive lesson content.
+        """You are a Principal Technical Instructor building interactive lesson content.
 
 Your task is to teach: '{concept_id}' under topic '{topic}' (Level: {level}, Pattern: {pattern}).
+
+TOPIC CONTEXT:
+- Topic Kind: {topic_kind}
+- Assessment Mode: {assessment_mode}
 
 Pedagogical Directives:
 
 1. Target Scope: Cover strictly what is required to master '{concept_id}'.
-   Keep explanations crisp, clear, and direct. "Intuition" and "Core
-   Principle" must NOT restate each other:
-     - Intuition = one short, informal "why this exists" framing (an
-       analogy or real-world parallel), no technical mechanism detail.
-     - Core Principle = the precise, formal technical definition/mechanism.
-   If you find yourself writing near-identical sentences in both, merge
-   the content into Core Principle and make Intuition purely the analogy.
+   Keep explanations crisp, clear, and direct. "Intuition" and "Core Principle" must NOT restate each other:
+     - Intuition = one short, informal "why this exists" framing (an analogy or real-world parallel), no code details here.
+     - Core Principle = the precise, formal technical definition, invariant, or operational mechanism.
 
-2. Language-Specific Implementation: Provide code in {language}
-   (python, cpp, js) that is GENUINELY COMPILABLE/RUNNABLE AS WRITTEN --
-   this is a hard requirement, not a style preference:
-     - Include every required operator, statement terminator, and header/
-       import. Never truncate or drop syntax elements (e.g. `cout << x`
-       must include the `<<`, not just `cout x`).
-     - The snippet must be a complete, self-contained unit (a function or
-       class plus a minimal call/usage line) that would run without
-       modification if pasted into a compiler/interpreter.
-     - Include inline comments highlighting the core mechanism only --
-       do not comment every line.
+2. Language-Specific Implementation / Technical Representation:
+   - If assessment_mode is 'code' or 'mixed': Provide code in {language} (python, cpp, js) that is GENUINELY COMPILABLE/RUNNABLE AS WRITTEN:
+     * Include every required operator, statement terminator, and header/import.
+     * The snippet must be a complete, self-contained unit that would run if pasted into an interpreter/compiler.
+     * Include inline comments highlighting the core mechanism only.
+   - If assessment_mode is 'conceptual_only': Provide a clear pseudo-code representation, mathematical definition, or theoretical illustration. Do not force irrelevant compiler syntax.
 
-3. Explanation Language: Write intuitions, core ideas, mechanisms,
-   step-by-step examples, common mistakes, and checkpoint questions in
-   {explanation_language} (english or hinglish).
-   - If 'hinglish': natural Hinglish (Hindi in Roman script mixed with
-     technical English terms), e.g. "Array ek contiguous memory layout hai
-     jisme elements index se access hote hain..."
-   - If 'english': clear technical English.
+3. Explanation Language: Write intuitions, core ideas, mechanisms, step-by-step examples, common mistakes, and checkpoint questions in {explanation_language} (english or hinglish).
 
-4. Concrete Step-by-Step Walkthrough: Trace a small, real data example
-   across 3-4 sequential states, showing the actual state change at each
-   step (not just narrating that a change happens).
+4. Concrete Step-by-Step Walkthrough: Trace a small, real data example or state transition across 3-4 sequential steps showing the actual state change at each step.
 
-5. Complexity Reporting: Report `time_complexity` as a single value UNLESS
-   this concept genuinely has different best-case vs worst-case behavior
-   (e.g. a search that can exit early) -- only in that case, also set
-   `has_case_variance: true` and fill `best_case`/`worst_case` separately.
-   For concepts with no such variance (e.g. a full traversal that always
-   visits every element), set `has_case_variance: false` and leave
-   `best_case`/`worst_case` null -- do not fill them with a duplicate value.
+5. Complexity Reporting: Report `time_complexity` and `space_complexity` where meaningful, or "N/A" if purely theoretical.
 
-6. Measurable Checkpoint -- must test a REAL distinguishing trade-off or
-   boundary case, not a restated definition:
-     - BAD example (do not do this): "Do we need to visit all nodes?"
-       with options that just restate yes/no -- this tests nothing.
-     - GOOD example: "If you forget to update the pointer inside the loop
-       in a linked list traversal, what happens?" with options covering
-       infinite loop / early termination / compile error / no effect --
-       this tests understanding of the actual failure mode.
-   Provide exactly 4 options as structured {{"id": ..., "text": ...}}
-   objects using ids "A", "B", "C", "D". Do NOT prefix or embed a letter/
-   label inside the `text` field itself (e.g. write "Infinite loop
-   occurs", NOT "A. Infinite loop occurs") -- the rendering layer applies
-   the label separately, and embedding it yourself causes duplicated/
-   garbled labels downstream. Set `correct_option_id` to just the id
-   ("A", "B", "C", or "D").
+6. Measurable Checkpoint: Must test a REAL distinguishing trade-off, invariant, or boundary case.
+   Provide exactly 4 options as structured {{"id": ..., "text": ...}} objects using ids "A", "B", "C", "D". Do NOT embed letter labels inside the text field. Set `correct_option_id` to just the id ("A", "B", "C", or "D").
 
-7. Standard Markdown Content Formatting: Format all text fields (`intuition`, `core_idea`, `mechanism`, `step_by_step_example`, `common_mistakes`) strictly using standard GitHub Flavored Markdown (bold key terms `**...**`, inline code `code`, markdown ordered/unordered lists, and clean linebreaks).
+7. Standard Markdown Content Formatting: Format all text fields strictly using standard GitHub Flavored Markdown.
 
 Output Format:
-Return ONLY valid JSON matching the schema. No markdown fences, no
-conversational prose.
+Return ONLY valid JSON matching the schema. No markdown fences, no conversational prose.
 {format_instructions}"""
     ),
     (
@@ -319,16 +304,16 @@ Explanation Language: {explanation_language}"""
 LESSON_MARKDOWN_PROMPT = ChatPromptTemplate.from_messages([
     (
         "system",
-        """You are an elite Computer Science educator and principal software engineer creating a comprehensive, beautifully structured concept lesson.
+        """You are an elite Computer Science educator creating a comprehensive, beautifully structured concept lesson.
 Your task is to teach '{concept_id}' under topic '{topic}' (Level: {level}, Pattern: {pattern}).
 
 Pedagogical Directives:
 1. Target Scope: Cover strictly what is required to master '{concept_id}'.
-   - Intuition: One short, intuitive analogy or real-world mental model.
-   - Core Principle: Formal technical definition and operational mechanism.
+   - Intuition: One short, intuitive analogy or mental model.
+   - Core Principle: Formal technical definition and operational mechanism or invariant.
    - Step-by-Step Walkthrough: Trace a small, real data example step-by-step showing state transitions.
-   - Implementation: Provide fully working, runnable code in {language} with imports, comments, and clear logic.
-   - Complexity Analysis: Exact Big-O Time Complexity (best/worst) and Space Complexity with clear mechanical reasons.
+   - Implementation / Code: Provide clean, working code in {language} (or pseudo-code/formal notation if conceptual).
+   - Complexity Analysis: Exact Time and Space Complexity with clear mechanical reasons (or theoretical bounds).
    - Edge Cases & Common Pitfalls: Key boundary conditions and common mistakes.
 
 2. Explanation Language: Write all explanations in {explanation_language} (english or hinglish).
@@ -349,12 +334,11 @@ Structure your lesson cleanly using:
 
 ## 💻 Implementation ({language})
 ```{language}
-[Clean, runnable code]
+[Clean code or pseudo-code]
 ```
 
 ## ⏱️ Complexity Analysis
-- **Time Complexity (Best Case):** `O(...)`
-- **Time Complexity (Worst Case):** `O(...)`
+- **Time Complexity:** `O(...)`
 - **Auxiliary Space:** `O(...)`
 - **Mechanical Reason:** [Explanation]
 
@@ -389,13 +373,11 @@ Your task is to teach the foundational overview of '{concept_id}' under topic '{
 
 Pedagogical Directives:
 1. Target Scope: Cover strictly what is required to master '{concept_id}'.
-   - Intuition = one short, informal "why this exists" framing (analogy or real-world parallel), no code details here.
+   - Intuition = one short, informal "why this exists" framing (analogy or real-world parallel).
    - Core Idea = the precise, formal technical definition/mechanism in 2-3 sentences.
    - Mechanism = step-by-step operational logic (1., 2., 3.).
 
-2. Language-Specific Implementation: Provide code in {language} (python, cpp, js) that is GENUINELY COMPILABLE/RUNNABLE as written:
-   - Include every required operator, statement terminator, and header/import.
-   - Never truncate syntax.
+2. Implementation: Provide code in {language} (python, cpp, js) if code/mixed, or clean pseudo-logic if conceptual.
 
 3. Explanation Language: Write all explanations in {explanation_language} (english or hinglish).
 
@@ -426,7 +408,7 @@ Pedagogical Directives:
 1. Step-by-Step Example: Trace a small real data example across 3-4 sequential states showing actual value transitions.
 2. Complexity Analysis: Provide best_case, worst_case, space, and a mechanical reason.
 3. Edge Cases & Common Mistakes: Name 2 real boundary conditions and 2 common student pitfalls.
-4. Measurable Checkpoint: 4 options testing a real failure mode or tradeoff. Set correct_option to matching text.
+4. Measurable Checkpoint: 4 options testing a real failure mode, invariant, or tradeoff. Set correct_option to matching text.
 
 Explanation Language: {explanation_language} (english or hinglish).
 
@@ -448,32 +430,26 @@ Explanation Language: {explanation_language}"""
 
 
 # ---------------------------------------------------------------------------
-# 4. QUESTION GENERATION — DSA-specific edge cases & complexity requirements
+# 4. QUESTION GENERATION — Metadata-tailored assessment engine
 # ---------------------------------------------------------------------------
 
 QUESTION_GEN_PROMPT = ChatPromptTemplate.from_messages([
     (
         "system",
-        """You are a DSA question-generation engine for an adaptive learning platform.
-You generate assessment questions for a single concept, at a single
-difficulty level, optionally tagged to a specific algorithmic pattern.
-Return ONLY valid JSON matching the schema below — no prose, no markdown
-fences, no explanation.
+        """You are a question-generation engine for an adaptive learning platform.
+You generate assessment questions for a single concept, at a single difficulty level.
+Return ONLY valid JSON matching the schema below — no prose, no markdown fences.
 
 Language & Style Directives:
 1. Programming Language: {language} (python | cpp | js).
-   - If concept_type is "code" or function_signature is required, generate code/signature in {language}.
-   - For 'cpp': Use C++ syntax, e.g. `int solution(vector<int>& nums)`.
-   - For 'js': Use JavaScript syntax, e.g. `function solution(nums)`.
-   - For 'python': Use Python syntax, e.g. `def solution(nums: list[int]) -> int:`.
+   - If concept_type is "code" or function_signature is required, generate signature in {language}.
+   - If concept_type is "conceptual" or "math", focus on reasoning, trace, invariant, or MCQ.
 2. Text & Explanation Language: {explanation_language} (english | hinglish).
-   - If explanation_language is 'hinglish', write question prompts, options, explanations, and descriptions in Hinglish (Hindi written in Roman script with English technical terms).
-   - If explanation_language is 'english', write in standard technical English.
-3. Standard Markdown Formatting: The `question` text MUST be formatted strictly in clean standard GitHub Flavored Markdown (use bold `**...**` for key requirements, inline code `O(n)` for complexity, clear markdown paragraphs, and fenced code blocks for sample data).
+3. Standard Markdown Formatting: The `question` text MUST be formatted strictly in clean standard GitHub Flavored Markdown.
 4. CRITICAL MCQ FORMAT RULES:
-   - For `type: "mcq"` or `"true_false"`, the `question` field MUST contain ONLY the question prompt/problem statement. DO NOT append or include options (like "A) ...", "B) ...") in the `question` field!
-   - The `options` list MUST contain the FULL textual choices (e.g. `["Constant O(1) time", "Linear O(n) time", "Logarithmic O(log n) time", "Quadratic O(n²) time"]`). NEVER return single letters `["A", "B", "C", "D"]` in `options`!
-   - The `correct_option` field MUST match the exact text of the correct choice from the `options` array (e.g. `"Constant O(1) time"`).
+   - For `type: "mcq"` or `"true_false"`, the `question` field MUST contain ONLY the question prompt. DO NOT include options in `question`!
+   - The `options` list MUST contain full textual choices. NEVER return single letters in `options`!
+   - The `correct_option` field MUST match the exact text of the correct choice from the `options` array.
 
 Schema:
 {{
@@ -483,15 +459,15 @@ Schema:
       "concept_id": string,
       "pattern": string | null,
       "difficulty": integer 1-5,
-      "question": string,                      // ONLY the question text; NEVER include options here
-      "options": [string] | null,              // Full descriptive text for each option; required for mcq/true_false
-      "correct_option": string | null,         // Exact text of the correct option matching an item in options
-      "rubric": string | null,                 // required for open_ended/practice
-      "expected_time_complexity": string | null,   // e.g. "O(n)" — required for practice + concept_type=code
-      "expected_space_complexity": string | null,  // e.g. "O(1)" — required for practice + concept_type=code
-      "function_signature": string | null,     // required for practice + concept_type=code
+      "question": string,
+      "options": [string] | null,
+      "correct_option": string | null,
+      "rubric": string | null,
+      "expected_time_complexity": string | null,
+      "expected_space_complexity": string | null,
+      "function_signature": string | null,
       "test_cases": [{{"input": string, "expected_output": string}}] | null,
-      "expected_answer": string | null         // required for short_answer/math
+      "expected_answer": string | null
     }}
   ]
 }}
@@ -515,19 +491,17 @@ Constraints:
     * "function_signature": MUST be provided in {language} with clear types.
     * "execution_method": Set strictly to "browser_compiler".
     * "test_cases": MUST provide 3 to 4 cases.
-      CRITICAL RULE FOR "input": Provide ONLY valid raw JSON array or value without variable assignment!
-      Good: "[]", "[1]", "[2, 2, 1, 1, 1, 2, 2]"
-      BAD: "nums = []", "nums = [1]*1000", "range(10)"
-    * "expected_output": The exact return value as string, e.g. "-1", "1", "2"."""
+      Provide ONLY valid raw JSON array or value without variable assignment!
+    * "expected_output": The exact return value as string."""
     )
 ])
 
 # ---------------------------------------------------------------------------
-# 5. EVALUATION — complexity is now a first-class graded signal
+# 5. EVALUATION — Complexity & correctness multi-signal evaluator
 # ---------------------------------------------------------------------------
 
 EVALUATION_RUBRIC_PROMPT = ChatPromptTemplate.from_template(
-    """You are a multi-signal DSA grading evaluator assessing a student's submission.
+    """You are a multi-signal grading evaluator assessing a student's submission.
 Concept: {concept_id}
 Question: {question}
 Expected rubric / solution: {rubric}
@@ -536,53 +510,34 @@ Expected space complexity: {expected_space_complexity}
 Student's submission: {answer}
 Execution signal feedback (test case pass/fail, if any): {execution_feedback}
 
-Grade against these SEPARATE signals — do not blend them into one vague score:
-1. correctness_score — did it pass the test cases / solve the problem?
-   (weight this most heavily if execution_feedback is present and reliable)
-2. complexity_score — does the student's actual approach achieve the
-   expected time/space complexity, or did they pass tests with a
-   suboptimal (e.g. brute-force) approach? A correct-but-suboptimal
-   solution must NOT score as highly as an optimal one.
-3. code_quality_score — readability, naming, structure.
-4. edge_case_score — did the submission handle empty/single/duplicate/
-   boundary inputs correctly, whether or not the provided test cases
-   caught it?
+Grade against these SEPARATE signals:
+1. correctness_score — did it pass the test cases or solve the problem conceptually?
+2. complexity_score — does the approach achieve expected bounds? If question is purely conceptual, base on correctness of reasoning.
+3. code_quality_score — clarity, naming, logical structure.
+4. edge_case_score — did submission handle boundary conditions?
 
-Assign an overall llm_quality_score between 0.0 and 1.0 as a weighted
-combination (correctness and complexity should dominate the weighting for
-DSA specifically), provide detailed feedback naming which signal(s) were
-weak, and return the per-criterion breakdown.
+Assign an overall llm_quality_score between 0.0 and 1.0 as a weighted combination, provide detailed feedback naming which signal(s) were weak, and return the per-criterion breakdown.
 
 Return structured JSON following format instructions:
 {format_instructions}"""
 )
 
 # ---------------------------------------------------------------------------
-# 6. RE-TEACH — DSA-specific strategy hints
+# 6. RE-TEACH — Adaptive Remediation & Strategy Hints
 # ---------------------------------------------------------------------------
 
 RETEACH_LESSON_PROMPT = ChatPromptTemplate.from_template(
-    """You are an adaptive DSA tutor re-teaching concept '{concept_id}' in topic '{topic}'.
+    """You are an adaptive tutor re-teaching concept '{concept_id}' in topic '{topic}'.
 Previous failed explanation strategies for this student: {strategies_tried}
 New pedagogical strategy to use: '{strategy}'
 
 Write an engaging, clear lesson explanation using the '{strategy}' technique:
 - analogy: relate the mechanism to a concrete real-world process.
-- visual_diagram: describe (in text/ASCII) a step-by-step visual trace of
-  the data structure/algorithm operating on a small concrete example —
-  this is usually the most effective strategy for DSA specifically, since
-  the core confusion is almost always about the mechanism over time, not
-  the definition.
-- interactive_exercise: pose a small trace-through question mid-explanation
-  ("pause here — what do you think happens to the pointer next?") before
-  revealing the answer.
-- worked_example: solve one small concrete problem fully, narrating the
-  reasoning at each step, including why the chosen approach achieves its
-  time/space complexity.
+- visual_diagram: describe (in text/ASCII) a step-by-step visual trace of the concept or state transitions.
+- interactive_exercise: pose a small trace-through checkpoint mid-explanation before revealing the answer.
+- worked_example: solve one small concrete problem fully, narrating the reasoning at each step.
 
-Explicitly connect the explanation back to time/space complexity — for a
-DSA platform, "why is this the complexity" is usually the actual source of
-confusion, not "what does this do."
+Explicitly target the demonstrated student misconceptions without simply repeating previous verbatim text.
 
 Return structured JSON following format instructions:
 {format_instructions}"""

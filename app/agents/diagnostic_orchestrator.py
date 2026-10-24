@@ -29,15 +29,19 @@ class DiagnosticOrchestrator:
         cls,
         concept: str,
         question: str,
-        answer: str
+        answer: str,
+        topic_kind: str = "technique",
+        assessment_mode: str = "mixed"
     ) -> Dict[str, Any]:
-        logger.info(f"[DiagnosticOrchestrator] Starting evaluation turn for concept='{concept}'")
+        logger.info(f"[DiagnosticOrchestrator] Starting evaluation turn for concept='{concept}', kind='{topic_kind}', mode='{assessment_mode}'")
 
         # Step 1: Run AnswerEvaluatorAgent
         grade: EvaluatorGradeSchema = await AnswerEvaluatorAgent.evaluate(
             concept=concept,
             question=question,
-            answer=answer
+            answer=answer,
+            topic_kind=topic_kind,
+            assessment_mode=assessment_mode
         )
         logger.info(
             f"[DiagnosticOrchestrator] EvaluatorAgent output: confidence={grade.confidence}, status={grade.status}"

@@ -49,14 +49,7 @@ class FeedbackAgent:
         except Exception as err:
             logger.error(f"[FeedbackAgent] Feedback generation LLM call failed for '{concept}': {err}", exc_info=True)
 
-        # High-quality fallback if LLM is unreachable
-        status_label = "Unassessed / Needs Practice" if grade.status == "unknown" else ("Partially Understood" if grade.status == "partial" else "Mastered")
-        gaps_list = "\n".join([f"- {g}" for g in grade.key_gaps]) if grade.key_gaps else "- Continue practicing implementation variants."
-        
-        fallback_md = (
-            f"**Assessment:** {status_label} for `{concept_title}`.\n\n"
-            f"- **Observation:** {grade.evaluation_summary}\n"
-            f"- **Identified Areas for Focus:**\n{gaps_list}\n\n"
-            f"- **Core Mechanism & Complexity:** Make sure to study the fundamental operational trace and constant vs linear time/space bounds for this topic."
-        )
+        # High-quality concise fallback if LLM is unreachable
+        status_label = "Needs Practice" if grade.status == "unknown" else ("Partially Understood" if grade.status == "partial" else "Mastered")
+        fallback_md = f"**{status_label}:** {grade.evaluation_summary or 'Response noted.'} Focus on standard operations and Big-O bounds for {concept_title}."
         return fallback_md

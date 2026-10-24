@@ -26,11 +26,16 @@ async def select_strategy_node(state: ReteachState) -> ReteachState:
         }
 
     next_strategy = remaining[0]
+    topic_raw = state.get("topic") or "DSA"
+    concept_id_raw = state.get("concept_id") or "concept"
+    from app.catalog.context import TopicGenerationContext
+    context = TopicGenerationContext.from_topic_identifier(topic_raw)
+
     res = await call_llm_gateway(
         RETEACH_LESSON_PROMPT,
         {
-            "concept_id": state["concept_id"],
-            "topic": state["topic"],
+            "concept_id": concept_id_raw,
+            "topic": context.canonical_topic,
             "strategies_tried": state.get("strategies_tried", []),
             "strategy": next_strategy
         },
@@ -48,9 +53,10 @@ async def select_strategy_node(state: ReteachState) -> ReteachState:
 
 async def fallback_prereq_node(state: ReteachState) -> ReteachState:
     """Triggers remediation regression for prerequisites when consecutive failures threshold is hit."""
+    cid = state.get("concept_id") or "this concept"
     return {
         **state,
-        "explanation_content": f"You've tried multiple explanation strategies for '{state['concept_id']}'. Let's revisit foundational prerequisites first to build a solid base.",
+        "explanation_content": f"You've tried multiple explanation strategies for '{cid}'. Let's revisit foundational prerequisites first to build a solid base.",
         "action": "spot_check_prereq"
     }
 

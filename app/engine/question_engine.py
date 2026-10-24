@@ -172,20 +172,35 @@ async def _generate_and_save_batch(
     language: str = "python",
     explanation_language: str = "english"
 ) -> List[Dict[str, Any]]:
+    from app.catalog.context import TopicGenerationContext
+    context = TopicGenerationContext.from_topic_identifier(
+        topic_clean,
+        selected_language=language
+    )
     diff_desc = DIFFICULTY_DESCRIPTIONS.get(difficulty, "standard conceptual understanding")
+    
+    # Adapt concept_type and question_type to topic assessment mode
+    if context.assessment_mode == "conceptual_only" and concept_type == "code":
+        eff_concept_type = "conceptual"
+    else:
+        eff_concept_type = concept_type
+
+    q_type_to_gen = "practice" if eff_concept_type == "code" else "mcq"
+    eff_lang = context.selected_language or language or "python"
+
     res = await call_llm_gateway(
         QUESTION_GEN_PROMPT,
         {
-            "topic": topic_clean,
+            "topic": context.canonical_topic,
             "concept_id": concept_id,
-            "pattern": "none",
-            "concept_type": concept_type,
+            "pattern": context.pattern_tags[0] if context.pattern_tags else "none",
+            "concept_type": eff_concept_type,
             "difficulty": difficulty,
             "difficulty_description": diff_desc,
-            "question_type": "practice" if concept_type == "code" else "mcq",
+            "question_type": q_type_to_gen,
             "count": min(needed, 3),  # Keeps tokens within safe limits
             "previous_question_titles": str(previous_titles) if previous_titles else "None",
-            "language": language,
+            "language": eff_lang,
             "explanation_language": explanation_language
         },
         QuestionBatchSchema
@@ -195,9 +210,9 @@ async def _generate_and_save_batch(
     for q_item in getattr(res, "questions", []):
         q_type = getattr(q_item, "type", "mcq") or "mcq"
         
-        if concept_type == "code" and q_type == "practice":
+        if eff_concept_type == "code" and q_type == "practice":
             method = "piston_api"
-        elif concept_type == "math":
+        elif eff_concept_type == "math":
             method = "sympy" if q_type == "practice" else "numeric_tolerance"
         elif q_type in ["mcq", "true_false"]:
             method = "exact_match"
@@ -217,9 +232,11 @@ async def _generate_and_save_batch(
         doc = {
             "_id": q_id,
             "id": q_id,
+            "topic_id": context.topic_id,
             "topic": topic_clean,
+            "canonical_topic": context.canonical_topic,
             "concept_id": concept_id,
-            "concept_type": concept_type,
+            "concept_type": eff_concept_type,
             "difficulty": getattr(q_item, "difficulty", difficulty) or difficulty,
             "type": q_type,
             "question": q_item.question,
@@ -231,7 +248,8 @@ async def _generate_and_save_batch(
                 for tc in q_item.test_cases
             ] if getattr(q_item, "test_cases", None) else None,
             "expected_answer": getattr(q_item, "expected_answer", None),
-            "execution_method": getattr(q_item, "execution_method", None) or method
+            "execution_method": getattr(q_item, "execution_method", None) or method,
+            "metadata_version": context.metadata_version
         }
         doc = normalize_mcq_question_fields(doc)
         new_docs.append(doc)
@@ -256,6 +274,8 @@ async def get_or_generate_question_batch(
     include_internal: bool = False
 ) -> List[Dict[str, Any]]:
     """Retrieves or creates a pool of questions, returning client-safe or internal versions."""
+    from app.catalog.context import TopicGenerationContext
+    context = TopicGenerationContext.from_topic_identifier(topic, selected_language=language)
     q_collection = mongo_db.get_collection("questions") if mongo_db is not None else None
     topic_clean = topic.strip().lower()
 
@@ -271,7 +291,11 @@ async def get_or_generate_question_batch(
     if q_collection is not None:
         filter_query = {
             "concept_id": concept_id,
-            "topic": topic_clean,
+            "$or": [
+                {"topic": topic_clean},
+                {"topic_id": context.topic_id},
+                {"canonical_topic": context.canonical_topic}
+            ],
             "difficulty": difficulty
         }
         try:

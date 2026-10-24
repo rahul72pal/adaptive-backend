@@ -17,6 +17,7 @@ from app.engine.curriculum_engine import (
     sync_learning_path_progress,
     record_user_completed_node,
     slugify_topic,
+    normalize_topic,
     get_available_nodes
 )
 from app.engine.mastery_engine import check_level_completion
@@ -152,7 +153,8 @@ async def complete_node(
     mongo_db: Any = Depends(get_mongo_db)
 ):
     """Marks a concept node as mastered, updates Postgres ConceptMastery, and syncs learning path progress in MongoDB."""
-    topic_slug = slugify_topic(payload.topic)
+    norm = normalize_topic(payload.topic)
+    topic_slug = norm["slug"]
     concept_id = payload.concept_id.strip().lower()
 
     try:

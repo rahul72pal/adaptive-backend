@@ -23,9 +23,14 @@ async def update_user_mastery_and_check_remediation(
     mongo_db: Any
 ) -> Dict[str, Any]:
     """Updates concept mastery in PostgreSQL and checks whether adaptive remediation or level unlock is needed."""
+    from app.engine.curriculum_engine import normalize_topic
+    norm = normalize_topic(topic)
+    topic_slug = norm["slug"]
+    topic_id = norm.get("topic_id", topic_slug)
+
     stmt = select(ConceptMastery).where(
         ConceptMastery.user_id == user_id,
-        ConceptMastery.topic == topic,
+        (ConceptMastery.topic == topic_slug) | (ConceptMastery.topic == topic) | (ConceptMastery.topic == topic_id),
         ConceptMastery.concept_id == concept_id
     )
     res = await db.execute(stmt)
@@ -34,7 +39,7 @@ async def update_user_mastery_and_check_remediation(
     if not mastery_record:
         mastery_record = ConceptMastery(
             user_id=user_id,
-            topic=topic,
+            topic=topic_slug,
             concept_id=concept_id,
             mastery=0.0,
             attempts=0,
@@ -97,9 +102,14 @@ async def calculate_topic_progress(
     mongo_db: Any
 ) -> Dict[str, Any]:
     """Calculates overall progress breakdown and current unlocked level threshold."""
+    from app.engine.curriculum_engine import normalize_topic
+    norm = normalize_topic(topic)
+    topic_slug = norm["slug"]
+    topic_id = norm.get("topic_id", topic_slug)
+
     stmt = select(ConceptMastery).where(
         ConceptMastery.user_id == user_id,
-        ConceptMastery.topic == topic
+        (ConceptMastery.topic == topic_slug) | (ConceptMastery.topic == topic) | (ConceptMastery.topic == topic_id)
     )
     res = await db.execute(stmt)
     records = res.scalars().all()
