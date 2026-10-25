@@ -136,9 +136,13 @@ def sanitize_question_for_client(q: Dict[str, Any]) -> Dict[str, Any]:
     safe_q.pop("correct_option", None)
     safe_q.pop("rubric", None)
     safe_q.pop("expected_answer", None)
+    safe_q.pop("hidden_test_cases", None)
+    if safe_q.get("_id") and not safe_q.get("id"):
+        safe_q["id"] = str(safe_q["_id"])
     safe_q.pop("_id", None)
     safe_q["markdown"] = build_question_markdown(safe_q)
     return safe_q
+
 
 def question_kind_for(concept_type: str) -> str:
     """Map a concept type onto the question kind used by the fast pipeline."""
@@ -236,6 +240,8 @@ async def generate_test_cases(
     statement: str,
     function_signature: Optional[str],
     language: str = "python",
+    input_adapter: str = "json_args_v1",
+    test_case_schema: str = "args_kwargs_json_v1",
     max_attempts: int = 2,
 ) -> List[Dict[str, Any]]:
     """Generate validated test cases with retry; never raises."""
@@ -247,6 +253,8 @@ async def generate_test_cases(
                     "statement": statement,
                     "function_signature": function_signature or "(infer from the statement)",
                     "language": language,
+                    "input_adapter": input_adapter,
+                    "test_case_schema": test_case_schema,
                 },
                 TestCaseListSchema,
             )
@@ -313,10 +321,22 @@ def build_question_doc(
         "expected_time_complexity": getattr(meta, "expected_time_complexity", None),
         "expected_space_complexity": getattr(meta, "expected_space_complexity", None),
         "function_signature": getattr(meta, "function_signature", None),
+        "execution_mode": getattr(meta, "execution_mode", None),
+        "input_adapter": getattr(meta, "input_adapter", None),
+        "output_adapter": getattr(meta, "output_adapter", None),
+        "supported_languages": getattr(meta, "supported_languages", None),
+        "test_case_schema": getattr(meta, "test_case_schema", None),
+        "comparison_mode": getattr(meta, "comparison_mode", None),
+        "problem_version": getattr(meta, "problem_version", None),
+        "absolute_tolerance": getattr(meta, "absolute_tolerance", None),
+        "relative_tolerance": getattr(meta, "relative_tolerance", None),
         "starter_code": getattr(meta, "starter_code", None),
         "expected_answer": getattr(meta, "expected_answer", None),
         "explanation": getattr(meta, "explanation", None),
-        "test_cases": test_cases or None,
+        # Keep a small public subset for the UI; the rest are judged only by
+        # the server when a submission is finalized.
+        "test_cases": (test_cases or [])[:2] or None,
+        "hidden_test_cases": (test_cases or [])[2:] or None,
         "language": language,
         "execution_method": "onecompiler" if is_code else "exact_match",
         "created_at": __import__("datetime").datetime.utcnow().isoformat(),
@@ -330,6 +350,8 @@ async def _find_cached_question(
     difficulty: int,
     concept_type: str,
     q_collection: Any,
+    language: Optional[str] = None,
+    exclude_question_ids: Optional[List[str]] = None,
 ) -> Optional[Dict[str, Any]]:
     if q_collection is None:
         return None
@@ -342,10 +364,14 @@ async def _find_cached_question(
         logger.warning("[question_engine] Cache read failed: %s", exc)
         return None
 
+    excluded_ids = {str(question_id) for question_id in (exclude_question_ids or [])}
     docs = [
         d for d in docs
         if not str(d.get("_id", "")).startswith("q_fallback_")
         and not str(d.get("id", "")).startswith("q_fallback_")
+        and str(d.get("id") or d.get("_id") or "") not in excluded_ids
+        and (not language or not d.get("language") or str(d.get("language")).lower() == language.lower())
+        and (not d.get("concept_type") or str(d.get("concept_type")).lower() == concept_type.lower())
     ]
     if not docs:
         return None
@@ -407,6 +433,8 @@ async def generate_single_question(
             statement or meta.question,
             getattr(meta, "function_signature", None),
             language,
+            getattr(meta, "input_adapter", "json_args_v1"),
+            getattr(meta, "test_case_schema", "args_kwargs_json_v1"),
         )
 
     doc = build_question_doc(
@@ -445,7 +473,7 @@ async def get_or_generate_question(
     q_collection = mongo_db.get_collection("questions") if mongo_db is not None else None
 
     cached = await _find_cached_question(
-        concept_id, topic_clean, difficulty, concept_type, q_collection
+        concept_id, topic_clean, difficulty, concept_type, q_collection, language
     )
     if cached:
         doc = dict(cached)
@@ -531,6 +559,10 @@ async def _generate_and_save_batch(
             random.shuffle(raw_opts)
 
         q_id = f"q_{uuid.uuid4().hex[:8]}"
+        generated_cases = [
+            tc.model_dump() if hasattr(tc, "model_dump") else tc
+            for tc in (getattr(q_item, "test_cases", None) or [])
+        ]
         doc = {
             "_id": q_id,
             "id": q_id,
@@ -545,10 +577,16 @@ async def _generate_and_save_batch(
             "options": raw_opts,
             "correct_option": raw_correct,
             "rubric": getattr(q_item, "rubric", None),
-            "test_cases": [
-                tc.model_dump() if hasattr(tc, "model_dump") else tc 
-                for tc in q_item.test_cases
-            ] if getattr(q_item, "test_cases", None) else None,
+            "test_cases": generated_cases[:2] if generated_cases else None,
+            "hidden_test_cases": generated_cases[2:] if q_type == "practice" and generated_cases else None,
+            "function_signature": getattr(q_item, "function_signature", None),
+            "execution_mode": "function" if q_type == "practice" else None,
+            "input_adapter": "legacy_json_v1" if q_type == "practice" else None,
+            "output_adapter": "legacy_python_v1" if q_type == "practice" else None,
+            "supported_languages": [language] if q_type == "practice" else None,
+            "test_case_schema": "legacy_json_v1" if q_type == "practice" else None,
+            "comparison_mode": "legacy_json_v1" if q_type == "practice" else None,
+            "problem_version": 1 if q_type == "practice" else None,
             "expected_answer": getattr(q_item, "expected_answer", None),
             "execution_method": getattr(q_item, "execution_method", None) or method,
             "metadata_version": context.metadata_version

@@ -13,6 +13,7 @@ from app.engine.question_engine import get_or_generate_question, get_or_generate
 from app.engine.evaluation_engine import evaluate_user_attempt
 from app.engine.mastery_engine import update_user_mastery_and_check_remediation
 from app.engine.curriculum_engine import sync_learning_path_progress, slugify_topic, record_user_completed_node
+from app.services.code_execution_service import execute_code
 
 router = APIRouter(prefix="/api", tags=["Question Engine & Evaluation"])
 
@@ -23,6 +24,7 @@ class GenerateQuestionSchema(BaseModel):
     difficulty: int = 3
     language: Optional[str] = "python"
     explanation_language: Optional[str] = "english"
+    exclude_question_ids: List[str] = Field(default_factory=list)
 
 class GenerateQuestionBatchSchema(BaseModel):
     topic: str
@@ -94,7 +96,13 @@ async def stream_question_generator(payload: GenerateQuestionSchema, mongo_db: A
 
     # 1. Warm cache → instant response
     cached = await _find_cached_question(
-        concept_id, topic_clean, difficulty, concept_type, q_collection
+        concept_id,
+        topic_clean,
+        difficulty,
+        concept_type,
+        q_collection,
+        language,
+        payload.exclude_question_ids,
     )
     if cached:
         safe_q = sanitize_question_for_client(dict(cached))
@@ -191,6 +199,15 @@ async def stream_question_generator(payload: GenerateQuestionSchema, mongo_db: A
         "event": "meta",
         "type": meta.type,
         "function_signature": meta.function_signature,
+        "execution_mode": meta.execution_mode,
+        "input_adapter": meta.input_adapter,
+        "output_adapter": meta.output_adapter,
+        "supported_languages": meta.supported_languages,
+        "test_case_schema": meta.test_case_schema,
+        "comparison_mode": meta.comparison_mode,
+        "problem_version": meta.problem_version,
+        "absolute_tolerance": meta.absolute_tolerance,
+        "relative_tolerance": meta.relative_tolerance,
         "options": meta.options,
         "rubric": meta.rubric,
         "expected_time_complexity": meta.expected_time_complexity,
@@ -206,11 +223,13 @@ async def stream_question_generator(payload: GenerateQuestionSchema, mongo_db: A
             statement,
             meta.function_signature,
             language,
+            meta.input_adapter or "json_args_v1",
+            meta.test_case_schema or "args_kwargs_json_v1",
         )
         yield _sse({
             "event": "test_cases",
-            "test_cases": test_cases,
-            "count": len(test_cases),
+            "test_cases": test_cases[:2],
+            "count": min(len(test_cases), 2),
             "generated": bool(test_cases),
         })
         yield _sse({"event": "tool_end", "tool": "code_and_tests"})
@@ -341,13 +360,41 @@ async def submit_attempt(
             "test_cases": [],
         }
 
+    # Re-run coding submissions against server-stored cases. Browser-reported
+    # pass counts are advisory only and can never grant acceptance.
+    q_type = question_doc.get("type", "mcq")
+    q_concept_type = question_doc.get("concept_type", "conceptual")
+    is_code_question = q_type == "practice" or q_concept_type in ("code", "practice")
+    verified_passed = 0
+    verified_total = 0
+    execution_status = None
+    if is_code_question:
+        stored_cases = (question_doc.get("test_cases") or []) + (question_doc.get("hidden_test_cases") or [])
+        verified_total = len(stored_cases)
+        if stored_cases:
+            signature = question_doc.get("function_signature") or "solution"
+            function_name = signature.split("(", 1)[0].strip().split()[-1]
+            contract_fields = ("execution_mode", "function_signature", "input_adapter", "output_adapter",
+                               "supported_languages", "test_case_schema", "comparison_mode", "problem_version",
+                               "absolute_tolerance", "relative_tolerance")
+            contract_data = {key: question_doc[key] for key in contract_fields if key in question_doc and question_doc[key] is not None}
+            run_result = await execute_code(
+                language=question_doc.get("language") or payload.language,
+                code=payload.answer,
+                test_cases=stored_cases,
+                function_name=function_name or "solution",
+                contract_data=contract_data or None,
+            )
+            execution_status = run_result.get("execution_status")
+            verified_passed = run_result.get("passed", 0) if execution_status == "completed" else 0
+
     # 1. Multi-Signal Evaluation
     eval_result = await evaluate_user_attempt(
         question_doc=question_doc,
         user_answer=payload.answer,
         test_run_count=payload.test_run_count or 0,
-        test_cases_passed=payload.test_cases_passed,
-        total_test_cases=payload.total_test_cases
+        test_cases_passed=verified_passed if is_code_question else payload.test_cases_passed,
+        total_test_cases=verified_total if is_code_question else payload.total_test_cases
     )
     score = eval_result["score"]
 
@@ -356,13 +403,8 @@ async def submit_attempt(
 
     # Hard execution gate: a coding question is only passed when EVERY
     # generated test case passes. The LLM rubric can never override this.
-    q_type = question_doc.get("type", "mcq")
-    q_concept_type = question_doc.get("concept_type", "conceptual")
-    is_code_question = q_type == "practice" or q_concept_type in ("code", "practice")
-    total_tests = payload.total_test_cases
-    if total_tests is None:
-        total_tests = len(question_doc.get("test_cases") or [])
-    passed_tests = payload.test_cases_passed or 0
+    total_tests = verified_total if is_code_question else (payload.total_test_cases or 0)
+    passed_tests = verified_passed if is_code_question else (payload.test_cases_passed or 0)
 
     if is_code_question:
         if total_tests <= 0:
@@ -385,6 +427,12 @@ async def submit_attempt(
                 f"Your solution passed {passed_tests}/{total_tests} test cases. "
                 "Fix the failing cases and run the tests again before advancing."
             )
+        if execution_status and execution_status != "completed":
+            is_passed = False
+            score = min(score, 0.5)
+            breakdown["correct"] = False
+            breakdown["execution_gate"] = f"Execution was not completed ({execution_status}); the answer was not accepted."
+            breakdown["feedback"] = "The code runner could not verify this submission. Try again after the runner is available."
 
     # 2. Insert Postgres attempt record
     attempt_record = Attempt(
@@ -463,11 +511,11 @@ async def submit_attempt(
         next_count = curr_count
         next_difficulty = payload.difficulty
 
-    # A concept is completed ONLY if the current attempt passed AND target correct count or EMA 0.85+ is reached
+    # Skipped question numbers do not count toward mastery. Complete only after
+    # enough correct answers or when the mastery score reaches its threshold.
     is_concept_completed = False
     if is_passed:
         is_concept_completed = (
-            next_count > target_count or
             node_correct_count >= target_count or
             mastery_update.get("new_mastery", 0.0) >= 0.85
         )

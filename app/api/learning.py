@@ -212,6 +212,53 @@ async def complete_node(
         logger.error(f"[complete_node] Error completing node '{concept_id}': {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to complete node: {str(e)}")
 
+
+@router.post("/skip-node")
+async def skip_node(
+    payload: CompleteNodeSchema,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    mongo_db: Any = Depends(get_mongo_db),
+):
+    """Skip a graph node without granting mastery, then unlock its dependents."""
+    topic_slug = normalize_topic(payload.topic)["slug"]
+    concept_id = payload.concept_id.strip().lower()
+    collection = mongo_db.get_collection("learning_paths")
+    user_id = str(current_user.id)
+    path_doc = None
+    learning_path_id = payload.learning_path_id or payload.path_id or payload.graph_id
+    if learning_path_id:
+        path_doc = await collection.find_one({"_id": learning_path_id, "user_id": user_id})
+    if not path_doc:
+        path_doc = await collection.find_one({"user_id": user_id, "topic": topic_slug})
+    if not path_doc:
+        raise HTTPException(status_code=404, detail="Learning path not found for this topic.")
+
+    nodes = path_doc.get("nodes") or []
+    node = next((item for item in nodes if (item.get("concept_id") or item.get("id")) == concept_id), None)
+    if not node:
+        raise HTTPException(status_code=404, detail="Node not found in this learning path.")
+    if node.get("status") in {"known", "mastered"}:
+        raise HTTPException(status_code=409, detail="A mastered node cannot be marked skipped.")
+    if node.get("status") == "locked":
+        raise HTTPException(status_code=409, detail="A locked node cannot be skipped before its prerequisites are complete.")
+
+    from datetime import datetime, timezone
+    node["status"] = "skipped"
+    node["skipped_at"] = datetime.now(timezone.utc).isoformat()
+    await collection.update_one({"_id": path_doc["_id"]}, {"$set": {"nodes": nodes}})
+
+    updated_doc = await sync_learning_path_progress(
+        user_id=current_user.id,
+        topic_slug=topic_slug,
+        mongo_db=mongo_db,
+        db=db,
+        learning_path_id=path_doc["_id"],
+    )
+    if not updated_doc:
+        raise HTTPException(status_code=404, detail="Learning path could not be advanced.")
+    return updated_doc
+
 from fastapi.responses import StreamingResponse
 import json
 

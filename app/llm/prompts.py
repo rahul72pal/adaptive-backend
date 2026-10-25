@@ -595,6 +595,13 @@ Produce JSON with these fields:
 - expected_time_complexity / expected_space_complexity: e.g. "O(n)" for coding tasks, else null
 - function_signature: the function name and parameters the tests will call, in {language}
   (e.g. "def two_sum(nums: list[int], target: int) -> list[int]:"), else null
+- For coding tasks declare execution_mode="function", input_adapter="json_args_v1"
+  for ordinary JSON arguments, output_adapter="json_value_v1", supported_languages=["{language}"],
+  test_case_schema="args_kwargs_json_v1", comparison_mode="exact_json_v1", problem_version=2.
+  Use "python_linked_list_args_v1" / "node_value_v1" for linked-list tasks,
+  "python_tree_level_order_args_v1" for binary trees, or
+  "python_graph_adjacency_args_v1" for graph adjacency tasks only when language is Python.
+  For JavaScript use json_args_v1/json_value_v1. Never infer from input shape.
 - starter_code: for practice tasks ONLY, complete self-contained starter code in
   {language} that already includes everything the learner needs, else null.
   * Put the function name on the LAST line of the file so the runner can find it.
@@ -628,13 +635,17 @@ Problem statement:
 
 Function signature ({language}):
 {function_signature}
+Declared input adapter: {input_adapter}
+Declared test-case schema: {test_case_schema}
 
 Rules:
 - Return 3 to 5 test cases.
-- `input` MUST be raw JSON data only, never a variable assignment.
-  * Invalid: "nums = [2, 7, 11, 15], target = 9".
-  * For a single array argument use "[2, 7, 11, 15]".
-  * For multiple arguments use a JSON array of arguments: "[[2,7,11,15], 9]".
+- `input` MUST be JSON object with `args` array and `kwargs` object, e.g.
+  {{"args":[[2,7,11,15],9],"kwargs":{{}}}}. Never emit positional argument guesses.
+- For linked lists, encode a typed argument as {{"$type":"linked_list","values":[...],"cycle_index":null}};
+  use an empty values array for an empty list and -1 or null for no cycle.
+- For binary trees, encode {{"$type":"binary_tree_level_order","serialization":"level_order_nulls_v1","values":[...] }}.
+- For graph adapters, encode {{"$type":"graph_adjacency","node_count":N,"edges":[[u,v]],"directed":false}}.
 - `expected_output` MUST be the exact JSON value the function returns
   (e.g. "[0, 1]", "true", "42", "\"abc\"").
 - Include at least one edge case (empty input, duplicates, negatives, or a single element).

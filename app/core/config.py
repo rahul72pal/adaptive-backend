@@ -90,8 +90,12 @@ class Settings(BaseSettings):
     CODE_EXECUTION_ENABLED: bool = True
     # OneCompiler code-execution API. The key is read from ONE_COMPILER_API.
     ONE_COMPILER_API: str = ""
-    ONE_COMPILER_API_URL: str = "https://api.onecompiler.com/api/code/exec"
+    ONE_COMPILER_API_URL: str = "https://api.onecompiler.com/v1/run"
+    # auto selects the request contract from the configured URL. Override only
+    # when using a compatible OneCompiler endpoint behind a custom URL.
+    ONE_COMPILER_API_VERSION: str = "auto"
     ONE_COMPILER_TIMEOUT_SECONDS: float = 25.0
+    ONE_COMPILER_MAX_OUTPUT_BYTES: int = 1_000_000
 
     # ------------------------------------------------------------------
     # Application

@@ -408,20 +408,20 @@ def validate_topological_sort(concepts: List[Dict[str, Any]], valid_prereq_ids: 
 
 def get_available_nodes(nodes: List[Dict[str, Any]], completed_ids: Optional[set] = None) -> List[Dict[str, Any]]:
     """
-    Finds nodes in the DAG whose prerequisites are all satisfied (completed/known)
-    and whose own status is not yet 'known' or 'mastered'.
+    Finds nodes whose prerequisites are satisfied (known, mastered, or explicitly
+    skipped) and which do not already have a terminal progress status.
     """
     if completed_ids is None:
         completed_ids = {
             n.get("concept_id") or n.get("id")
             for n in nodes
-            if n.get("status") in ["known", "mastered"]
+            if n.get("status") in ["known", "mastered", "skipped"]
         }
 
     available = []
     for node in nodes:
         cid = node.get("concept_id") or node.get("id")
-        if node.get("status") in ["known", "mastered"]:
+        if node.get("status") in ["known", "mastered", "skipped"]:
             continue
         deps = set(node.get("depends_on", []))
         if deps.issubset(completed_ids):
@@ -1057,7 +1057,7 @@ async def generate_next_level_graph(
         target_q_count = 0 if node_type == "learning" else (c.get("target_question_count") or 5)
 
         has_prereqs = bool(c.get("depends_on"))
-        completed_set = {n["concept_id"] for n in existing_nodes if n.get("status") in ["known", "mastered"]}
+        completed_set = {n["concept_id"] for n in existing_nodes if n.get("status") in ["known", "mastered", "skipped"]}
         deps_met = set(c.get("depends_on", [])).issubset(completed_set)
 
         status = "learning" if (not has_prereqs or deps_met) else "locked"
@@ -1105,7 +1105,7 @@ async def generate_next_level_graph(
     if current_level not in completed_levels:
         completed_levels.append(current_level)
 
-    completed_ids = {n["concept_id"] for n in all_nodes if n.get("status") in ["known", "mastered"]}
+    completed_ids = {n["concept_id"] for n in all_nodes if n.get("status") in ["known", "mastered", "skipped"]}
     avail = [n["concept_id"] for n in get_available_nodes(all_nodes, completed_ids)]
     first_active = avail[0] if avail else (all_nodes[0]["concept_id"] if all_nodes else None)
 
@@ -1185,9 +1185,21 @@ async def sync_learning_path_progress(
     user_completed_ids = set((ut_doc.get("completed_node_ids") if ut_doc else []) or [])
 
     completed_ids = set(user_completed_ids)
+    skipped_ids = {
+        n.get("concept_id") or n.get("id")
+        for n in nodes
+        if n.get("status") == "skipped" and (n.get("concept_id") or n.get("id"))
+    }
+    completed_ids.update(skipped_ids)
     for n in nodes:
         cid = n.get("concept_id") or n.get("id")
         if not cid:
+            continue
+
+        if cid in skipped_ids:
+            # Skipping unlocks dependents and advances the graph, but it never
+            # writes a mastery record or counts toward the mastery metric.
+            n["status"] = "skipped"
             continue
 
         pg_status = mastery_map.get(cid)
@@ -1207,7 +1219,7 @@ async def sync_learning_path_progress(
 
     for n in nodes:
         cid = n.get("concept_id") or n.get("id")
-        if n.get("status") not in ["known", "mastered"]:
+        if n.get("status") not in ["known", "mastered", "skipped"]:
             deps = set(n.get("depends_on", []))
             if not deps or deps.issubset(completed_ids):
                 if n.get("status") == "locked":
